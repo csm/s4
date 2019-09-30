@@ -89,7 +89,7 @@
   [header]
   (when-let [[mech auth-str] (some-> header (.split " " 2))]
     (when (= (string/lower-case mech) "aws4-hmac-sha256")
-      (let [auth-map (->> (.split auth-str ",")
+      (let [auth-map (->> (.split auth-str ",[ ]*")
                           (map #(let [[k v] (.split % "=" 2)]
                                   [(keyword k) v]))
                           (into {}))]
@@ -196,6 +196,7 @@
   [handler {:keys [auth-store]}]
   (fn [request respond error]
     (async/go
+      (log/debug :task ::authenticating-handler :phase :begin :request (pr-str request))
       (try
         (if-let [auth-header (debug "parse-auth-header:" (parse-auth-header (get-in request [:headers "authorization"])))]
           (if-let [secret-access-key (debug "get-secret-access-key:" (sv/<?? sv/S (s4p/-get-secret-access-key auth-store (get-in auth-header [:Credential :access-key]))))]
