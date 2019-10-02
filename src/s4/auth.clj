@@ -219,3 +219,8 @@
           (respond {:status 401}))
         (catch Exception x (error x))))))
 
+(defrecord AtomAuthStore [access-keys]
+  s4p/AuthStore
+  (-get-secret-access-key [_ access-key-id]
+    (async/go
+      (get @access-keys access-key-id))))

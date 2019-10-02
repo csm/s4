@@ -150,3 +150,10 @@
 (aws/invoke s3-client {:op :DeleteBucket
                        :request {:Bucket "test"}})
 
+(dotimes [i 100]
+  (aws/invoke s3-client {:op :PutObject
+                         :request {:Bucket "test"
+                                   :Key (format "file%02x.txt" i)
+                                   :Body (byte-array (repeat i (.byteValue i)))}}))
+
+(s4.$$$$/get-cost-estimate cost-tracker (java.util.Date.))
