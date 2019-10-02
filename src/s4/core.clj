@@ -11,8 +11,44 @@
             [s4.$$$$ :as $]
             [s4.auth :as auth]
             [superv.async :as sv])
-  (:import [java.time ZonedDateTime]
-           [java.time.format DateTimeFormatter]))
+  (:import [java.time ZonedDateTime ZoneId LocalDate LocalDateTime Instant]
+           [java.time.format DateTimeFormatter DateTimeParseException]
+           [java.nio ByteBuffer]
+           [java.security SecureRandom MessageDigest]
+           [java.util Base64 List]
+           [com.google.common.io ByteStreams]
+           [java.io ByteArrayInputStream]
+           [org.fressian.handlers ReadHandler WriteHandler]
+           [clojure.lang PersistentTreeMap]))
+
+(def write-handlers
+  (atom {PersistentTreeMap
+         {"sorted-map"
+          (reify WriteHandler
+            (write [_ wtr m]
+              (.writeTag wtr "sorted-map" 1)
+              (.writeObject wtr (mapcat identity m))))}
+         ZonedDateTime
+         {"zoned-inst"
+          (reify WriteHandler
+            (write [_ wtr t]
+              (.writeTag wtr "zoned-inst" 2)
+              (.writeInt wtr (-> ^ZonedDateTime t ^Instant (.toInstant) (.toEpochMilli)))
+              (.writeString wtr (.getId (.getZone ^ZonedDateTime t)))))}}))
+
+(def read-handlers
+  (atom {"sorted-map"
+         (reify ReadHandler
+           (read [_ rdr tag component-count]
+             (let [kvs ^List (.readObject rdr)]
+               (PersistentTreeMap/create (seq kvs)))))
+         "zoned-inst"
+         (reify ReadHandler
+           (read [_ rdr tag component-count]
+             (let [milli (.readInt rdr)
+                   zone-id ^String (.readObject rdr)]
+               (ZonedDateTime/ofInstant (Instant/ofEpochMilli milli)
+                                        (ZoneId/of zone-id)))))}))
 
 (defn- drop-leading-slashes
   [path]
@@ -32,12 +68,729 @@
       (vec (.split (drop-leading-slashes (:uri request)) "/" 2)))))
 
 (def xml-content-type {"content-type" "application/xml"})
+(def s3-xmlns "http://s3.amazonaws.com/doc/2006-03-01/")
+
+(defn bucket-put-ops
+  [bucket request {:keys [konserve]} request-id]
+  (sv/go-try sv/S
+    (let [params (keywordize-keys (uri/query->map (:query-string request)))]
+      (if (empty? params)
+        (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+          {:status 409
+           :headers xml-content-type
+           :body [:Error
+                  [:Code "BucketAlreadyExists"]
+                  [:Resource (str \/ bucket)]
+                  [:RequestId request-id]]}
+          (do
+            (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket] {:created (ZonedDateTime/now auth/UTC)
+                                                                      :object-count 0}))
+            (sv/<? sv/S (kp/-assoc-in konserve [:version-meta bucket] (sorted-map)))
+            {:status 200
+             :headers {"location" (str \/ bucket)}}))
+        (if-let [existing-bucket (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
+          (cond (some? (:versioning params))
+                (if-let [config (some-> (:body request) (xml/parse :namespace-aware false))]
+                  (if (= "VersioningConfiguration" (name (:tag config)))
+                    (if-let [new-state (#{"Enabled" "Suspended"} (some->> config
+                                                                          :content
+                                                                          (filter #(= :Status (:tag %)))
+                                                                          (first)
+                                                                          :content
+                                                                          (first)))]
+                      (let [current-state (:versioning existing-bucket)]
+                        (when (not= current-state new-state)
+                          (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket :versioning] new-state)))
+                        {:status 200})
+                      {:status 400
+                       :headers xml-content-type
+                       :body [:Error
+                              [:Code "IllegalVersioningConfigurationException"]
+                              [:Resource (str \/ bucket)]
+                              [:RequestId request-id]]})
+                    {:status 400
+                     :headers xml-content-type
+                     :body [:Error
+                            [:Code "IllegalVersioningConfigurationException"]
+                            [:Resource (str \/ bucket)]
+                            [:RequestId request-id]]})
+                  {:status 400
+                   :headers xml-content-type
+                   :body [:Error
+                          [:Code "MissingRequestBodyError"]
+                          [:Resource (str \/ bucket)]
+                          [:RequestId request-id]]})
+
+                (some? (:tagging params))
+                (if-let [config (some-> (:body request) (xml/parse :namespace-aware false))]
+                  (if (= :Tagging (:tag config))
+                    (let [tags (->> (:content config)
+                                    (filter #(= :TagSet (:tag %)))
+                                    first
+                                    :content
+                                    (filter #(= :Tag (:tag %)))
+                                    (map :content)
+                                    (map (fn [tags] (filter #(#{:Key :Value} (:tag %)) tags)))
+                                    (map (fn [tags] [(->> tags (filter #(= :Key (:tag %))) first :content first)
+                                                     (->> tags (filter #(= :Value (:tag %))) first :content first)])))]
+                      (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket :tags] tags))
+                      {:status 204}))
+                  {:status 400
+                   :headers xml-content-type
+                   :body [:Error
+                          [:Code "MissingRequestBodyError"]
+                          [:Resource (str \/ bucket)]
+                          [:RequestId request-id]]})
+
+                ; todo cors - too lazy to parse out the damn xml right now
+
+                :else
+                {:status 200
+                 :headers xml-content-type
+                 :body [:Error [:Code "NotImplemented"] [:Resource (str \/ bucket)] [:RequestId request-id]]})
+          {:status 404
+           :headers xml-content-type
+           :body [:Error [:Code "NoSuchBucket"] [:Resource (str \/ bucket)] [:RequestId request-id]]})))))
+
+(defn list-objects-v2
+  [bucket bucket-meta request {:keys [konserve]} request-id]
+  (sv/go-try sv/S
+    {:status 501}))
+
+(defn list-versions
+  [bucket bucket-meta request {:keys [konserve]} request-id]
+  (sv/go-try sv/S
+    (let [{:keys [delimiter encoding-type key-marker max-keys prefix version-id-marker]
+           :or {max-keys "1000" key-marker "" version-id-marker ""}}
+          (keywordize-keys (uri/query->map (:query-string request)))
+          encode-key (fn [k] (if (= "uri" encoding-type)
+                               (uri/uri-encode k)
+                               k))
+          max-keys (Integer/parseInt max-keys)
+          versions (sv/<? sv/S (kp/-get-in konserve [:version-meta bucket]))
+          versions (mapcat (fn [[key versions]]
+                             (let [[current & others] versions]
+                               (cons (assoc current :key key :current? true)
+                                     (map #(assoc % :key key) others))))
+                           versions)
+          versions (drop-while (fn [{:keys [key]}]
+                                 (neg? (compare key key-marker)))
+                               versions)
+          versions (if (empty? version-id-marker)
+                     versions
+                     (let [seen? (atom false)]
+                       (drop-while (fn [{:keys [version-id]}]
+                                     (if @seen?
+                                       false
+                                       (do
+                                         (when (= (or version-id "null") version-id-marker)
+                                           (reset! seen? true))
+                                         true)))
+                                   versions)))
+          versions (if (and (some? delimiter) (some? prefix))
+                     (filter #(string/starts-with? (:key %) prefix) versions)
+                     versions)
+          common-prefixes (when (some? delimiter)
+                            (->> versions
+                                 (map :key)
+                                 (dedupe)
+                                 (filter #(or (nil? prefix) (string/starts-with? % prefix)))
+                                 (filter #(string/includes? (subs % (some-> (or prefix "") count)) delimiter))
+                                 (map #(str prefix (subs % (some-> (or prefix "") count) (string/index-of % delimiter (some-> (or prefix "") count)))))))
+          versions (if (some? delimiter)
+                     (if (some? prefix)
+                       (filter #(not (string/includes? (subs (:key %) (count prefix)) delimiter)) versions)
+                       (filter #(not (string/includes? (:key %) delimiter)) versions))
+                     versions)
+          truncated? (> (count versions) max-keys)
+          versions (take max-keys versions)
+          last-version (when truncated? (last versions))
+          {:keys [delete-markers versions]} (group-by (fn [{:keys [deleted?]}]
+                                                        (if deleted? :delete-markers :versions))
+                                                      versions)
+          result [:ListVersionsResult {:xmlns s3-xmlns}
+                  [:Name bucket]
+                  [:Prefix prefix]
+                  [:KeyMarker key-marker]
+                  [:VersionIdMarker version-id-marker]
+                  [:MaxKeys max-keys]
+                  [:IsTruncated truncated?]]
+          result (if truncated?
+                   (conj result [:NextKeyMarker (:key last-version)]
+                         [:NextVersionIdMarker (or (:version-id last-version) "null")])
+                   result)
+          result (reduce conj result (map (fn [marker]
+                                            [:DeleteMarker
+                                             [:Key (encode-key (:key marker))]
+                                             [:VersionId (or (:version-id marker) "null")]
+                                             [:IsLatest (boolean (:current? marker))]
+                                             [:LastModified (.format (:created marker) DateTimeFormatter/ISO_OFFSET_DATE_TIME)]
+                                             [:Owner [:ID "S4"]]])
+                                          delete-markers))
+          result (reduce conj result (map (fn [version]
+                                            [:Version
+                                             [:Key (encode-key (:key version))]
+                                             [:VersionId (or (:version-id version) "null")]
+                                             [:IsLatest (boolean (:current? version))]
+                                             [:LastModified (.format (:created version) DateTimeFormatter/ISO_OFFSET_DATE_TIME)]
+                                             [:ETag (:etag version)]
+                                             [:Size (:content-length version)]
+                                             [:Owner [:ID "S4"]]
+                                             [:StorageClass "STANDARD"]])
+                                          versions))
+          result (reduce conj result (map (fn [prefix]
+                                            [:CommonPrefixes [:Prefix prefix]])
+                                          common-prefixes))]
+      {:status 200
+       :headers xml-content-type
+       :body result})))
+
+(defn list-objects
+  [bucket bucket-meta request {:keys [konserve]} request-id]
+  (sv/go-try sv/S
+    {:status 501}))
+
+(defn bucket-get-ops
+  [bucket request {:keys [konserve cost-tracker] :as system} request-id]
+  (sv/go-try sv/S
+    (let [params (keywordize-keys (uri/query->map (:query-string request)))]
+      (log/debug :task ::s3-handler :phase :get-bucket-request :bucket bucket :params params)
+      (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+        (cond
+          (= "2" (:list-type params))
+          (do
+            ($/-track-put-request! cost-tracker)
+            (sv/<? sv/S (list-objects-v2 bucket existing-bucket request system request-id)))
+
+          (some? (:versions params))
+          (do
+            ($/-track-put-request! cost-tracker)
+            (sv/<? sv/S (list-versions bucket existing-bucket request system request-id)))
+
+          (some? (:accelerate params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:AccelerateConfiguration {:xmlns s3-xmlns}
+                    [:Status {} "Suspended"]]})
+
+          (some? (:cors params))
+          (let [cors (:cors existing-bucket)]
+            ($/-track-get-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:CORSConfiguration {}
+                    (map (fn [{:keys [header origin method max-age expose-header]}]
+                           [:CORSRule {}
+                            (concat
+                              (map (fn [header] [:AllowedHeader {} header]) header)
+                              (map (fn [origin] [:AllowedOrigin {} origin]) origin)
+                              (map (fn [method] [:AllowedMethod {} method]) method)
+                              (map (fn [max-age] [:MaxAgeSeconds {} max-age]) max-age)
+                              (map (fn [header] [:ExposeHeader {} header]) expose-header))])
+                         cors)]})
+
+          (some? (:encryption params)) ; todo maybe support this?
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 404
+             :headers xml-content-type
+             :body [:Error {}
+                    [:Code {} "ServerSideEncryptionConfigurationNotFoundError"]
+                    [:Resource (str \/ bucket)]
+                    [:RequestId request-id]]})
+
+          (some? (:acl params)) ; todo maybe support this?
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:AccessControlPolicy {}
+                    [:Owner {}
+                     [:ID {} "S4"]
+                     [:DisplayName {} "You Know, for Data"]]
+                    [:AccessControlList {}
+                     [:Grant
+                      [:Grantee {"xmlns:xsi" "http://www.w3.org/2001/XMLSchema-instance"
+                                 "xsi:type" "CanonicalUser"}
+                       [:ID {} "S4"]
+                       [:DisplayName {} "You Know, for Data"]]
+                      [:Permission {} "FULL_CONTROL"]]]]})
+
+          (some? (:inventory params))
+          (if (some? (:id params))
+            (do
+              ($/-track-get-request! cost-tracker)
+              {:status 200
+               :headers xml-content-type
+               :body [:InventoryConfiguration {}]})
+            (do
+              ($/-track-put-request! cost-tracker)
+              {:status 200
+               :headers xml-content-type
+               :body [:ListInventoryConfigurationsResult {:xmlns s3-xmlns}
+                      [:IsTruncated {} "false"]]}))
+
+          (some? (:lifecycle params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 404
+             :headers xml-content-type
+             :body [:Error {}
+                    [:Code {} "NoSuchLifecycleConfiguration"]
+                    [:Resource {} (str \/ bucket)]
+                    [:RequestId {} request-id]]})
+
+          (some? (:location params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:LocationConstraint {}]})
+
+          (some? (:publicAccessBlock params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 404
+             :headers xml-content-type
+             :body [:Error {}
+                    [:Code {} "NoSuchPublicAccessBlockConfiguration"]
+                    [:Resource {} (str \/ bucket)]
+                    [:RequestId {} request-id]]})
+
+          (some? (:logging params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:BucketLoggingStatus {:xmlns "http://doc.s3.amazonaws.com/2006-03-01"}]})
+
+          (some? (:metrics params))
+          (if (some? (:id params))
+            (do
+              ($/-track-get-request! cost-tracker)
+              {:status 200
+               :headers xml-content-type
+               :body [:MetricsConfiguration {:xmlns s3-xmlns}]})
+            (do
+              ($/-track-put-request! cost-tracker)
+              {:status 200
+               :headers xml-content-type
+               :body [:ListMetricsConfigurationsResult {:xmlns s3-xmlns}
+                      [:IsTruncated {} "false"]]}))
+
+          (some? (:notification params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:NotificationConfiguration {:xmlns s3-xmlns}]})
+
+          (or (some? (:policyStatus params)) (some? (:policy params)))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 404
+             :headers xml-content-type
+             :body [:Error {}
+                    [:Code {} "NoSuchBucketPolicy"]
+                    [:Resource (str \/ bucket)]
+                    [:RequestId request-id]]})
+
+          (some? (:versions params))
+          (do
+            ($/-track-put-request! cost-tracker)
+            {:status 501
+             :headers xml-content-type
+             :body [:Error {}
+                    [:Code {} "NotImplemented"]
+                    [:Resource {} (str \/ bucket)]
+                    [:RequestId {} request-id]]})
+
+          (some? (:replication params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 404
+             :headers xml-content-type
+             :body [:Error {}
+                    [:Code {} "ReplicationConfigurationNotFoundError"]
+                    [:Resource {} (str \/ bucket)]
+                    [:RequestId {} request-id]]})
+
+          (some? (:requestPayment params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:RequestPaymentConfiguration {:xmlns s3-xmlns}
+                    [:Payer {} "BucketOwner"]]})
+
+          (some? (:tagging params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            (if-let [tags (not-empty (get existing-bucket :tags))]
+              {:status 200
+               :headers xml-content-type
+               :body [:Tagging {}
+                      [:TagSet {}
+                       (map (fn [[key value]]
+                              [:Tag {}
+                               [:Key {} (str key)]
+                               [:Value {} (str value)]])
+                            tags)]]}
+              {:status 404
+               :headers xml-content-type
+               :body [:Error {}
+                      [:Code {} "NoSuchTagSet"]
+                      [:Resource {} (str \/ bucket)]
+                      [:RequestId {} request-id]]}))
+
+          (some? (:versioning params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            (let [config (get existing-bucket :versioning)]
+              (cond (nil? config)
+                    {:status 200
+                     :headers xml-content-type
+                     :body [:VersioningConfiguration {:xmlns s3-xmlns}]}
+
+                    :else
+                    {:status 200
+                     :headers xml-content-type
+                     :body [:VersioningConfiguration {:xmlns s3-xmlns}
+                            [:Status {} config]]})))
+
+          (some? (:website params))
+          (do
+            ($/-track-get-request! cost-tracker)
+            {:status 404
+             :headers xml-content-type
+             :body [:Error {}
+                    [:Code {} "NoSuchWebsiteConfiguration"]
+                    [:Resource {} (str \/ bucket)]
+                    [:RequestId {} request-id]]})
+
+          (some? (:analytics params))
+          (do
+            ($/-track-put-request! cost-tracker)
+            {:status 200
+             :headers xml-content-type
+             :body [:ListBucketAnalyticsConfigurationResult {:xmlns s3-xmlns}
+                    [:IsTruncated {} "false"]]})
+
+          (some? (:uploads params))
+          (do
+            ($/-track-put-request! cost-tracker)
+            (let [{:keys [delimiter encoding-type max-uploads key-marker prefix upload-id-marker]
+                   :or {max-uploads "1000" key-marker "" upload-id-marker ""}}
+                  params
+                  max-uploads (Integer/parseInt max-uploads)
+                  uploads (sv/<? sv/S (kp/-get-in konserve [:uploads bucket]))
+                  uploads (doall (drop-while (fn [[[key upload-id]]]
+                                               (and (not (pos? (compare key key-marker)))
+                                                    (not (pos? (compare upload-id upload-id-marker)))))
+                                             uploads))
+                  uploads (doall (if (and (some? delimiter) (some? prefix))
+                                   (filter #(string/starts-with? (first (key %)) prefix) uploads)
+                                   uploads))
+                  common-prefixes (doall (when (some? delimiter)
+                                           (->> uploads
+                                                (map (comp first key))
+                                                (filter #(or (nil? prefix) (string/starts-with? % prefix)))
+                                                (filter #(string/includes? (subs % (some-> (or prefix "") count)) delimiter))
+                                                (map #(str prefix (subs % (some-> (or prefix "") count) (string/index-of % delimiter (some-> (or prefix "") count)))))
+                                                (set))))
+                  uploads (doall (if (some? delimiter)
+                                   (if (some? prefix)
+                                     (filter #(not (string/includes? (subs (first (key %)) (count prefix)) delimiter)) uploads)
+                                     (filter #(not (string/includes? (first (key %)) delimiter)) uploads))
+                                   uploads))
+                  truncated? (> (count uploads) max-uploads)
+                  uploads (take max-uploads uploads)
+                  result [:ListMultipartUploadsResult {:xmlns s3-xmlns}
+                          [:Bucket {} bucket]
+                          [:KeyMarker {} key-marker]
+                          [:UploadIdMarker {} upload-id-marker]
+                          [:NextKeyMarker {} (if truncated? (first (key (last uploads))) "")]
+                          [:NextUploadIdMarker {} (if truncated? (second (key (last uploads))) "")]
+                          [:MaxUploads {} (str max-uploads)]
+                          [:IsTruncated {} truncated?]]
+                  result (if encoding-type
+                           (conj result [:EncodingType {} encoding-type])
+                           result)
+                  result (reduce conj result
+                                 (map (fn [[[key upload-id] {:keys [created]}]]
+                                        [:Upload {}
+                                         [:Key {} key]
+                                         [:UploadId {} upload-id]
+                                         [:Initiator {}
+                                          [:ID {} "S4"]
+                                          [:DisplayName {} "You Know, for Data"]]
+                                         [:Owner {}
+                                          [:ID {} "S4"]
+                                          [:DisplayName {} "You Know, for Data"]]
+                                         [:StorageClass {} "STANDARD"]
+                                         [:Initiated {} (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME created)]])
+                                      uploads))
+                  result (reduce conj result
+                                 (map (fn [prefix]
+                                        [:CommonPrefixes {}
+                                         [:Prefix {} prefix]])
+                                      common-prefixes))]
+              {:status 200
+               :headers xml-content-type
+               :body result}))
+
+          :else
+          (do
+            ($/-track-put-request! cost-tracker)
+            (sv/<? sv/S (list-objects bucket existing-bucket request system request-id))))
+
+        (do
+          ($/-track-get-request! cost-tracker)
+          {:status 404
+           :headers xml-content-type
+           :body [:Error {}
+                  [:Code {} "NoSuchBucket"]
+                  [:Resource {} (str \/ bucket)]
+                  [:RequestId {} request-id]]})))))
+
+(def random (SecureRandom.))
+
+(defn put-object
+  [bucket object request {:keys [konserve cost-tracker]} request-id]
+  (sv/go-try sv/S
+    (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+      (let [blob-id (let [b (byte-array 16)
+                          buf (ByteBuffer/wrap b)]
+                      (.putLong buf (System/currentTimeMillis))
+                      (.putLong buf (.nextLong random))
+                      (.encodeToString (Base64/getUrlEncoder) b))
+            version-id (when (= "Enabled" (:versioning existing-bucket))
+                         blob-id)
+            content (some-> (:body request) (ByteStreams/toByteArray))
+            etag (let [md (MessageDigest/getInstance "MD5")]
+                   (some->> content (.update md))
+                   (->> (.digest md)
+                        (map #(format "%02x" %))
+                        (string/join)))
+            content-type (get-in request [:headers "content-type"] "binary/octet-stream")]
+        (when (some? content)
+          ($/-track-data-in! cost-tracker (count content))
+          (sv/<? sv/S (kp/-assoc-in konserve [:blobs bucket blob-id] content)))
+        (sv/<? sv/S (kp/-update-in konserve [:version-meta bucket object]
+                                   (fn [versions]
+                                     (cons
+                                       {:blob-id        blob-id
+                                        :version-id     version-id
+                                        :created        (ZonedDateTime/now ^ZoneId auth/UTC)
+                                        :etag           (str \" etag \")
+                                        :content-type   content-type
+                                        :content-length (count content)}
+                                       (if (= "Enabled" (:versioning existing-bucket))
+                                         versions
+                                         (vec (filter #(= version-id (:version-id %)) versions)))))))
+        {:status 200
+         :headers (as-> {"ETag" etag} h
+                        (if (some? version-id)
+                          (assoc h "x-amz-version-id" version-id)
+                          h))})
+      {:status 404
+       :headers xml-content-type
+       :body [:Error
+              [:Code "NoSuchBucket"]
+              [:Resource (str \/ bucket)]
+              [:RequestId request-id]]})))
+
+(defn parse-date-header
+  [d]
+  (try
+    (ZonedDateTime/parse d DateTimeFormatter/RFC_1123_DATE_TIME)
+    (catch DateTimeParseException _
+      (try
+        (ZonedDateTime/parse d auth/RFC-1036-FORMATTER)
+        (catch DateTimeParseException _
+          (ZonedDateTime/parse d auth/ASCTIME-FORMATTER))))))
+
+(defn parse-range
+  [r]
+  (let [[begin end] (rest (re-matches #"bytes=([0-9]+)-([0-9]*)" r))]
+    (when (some? begin)
+      [(Long/parseLong begin)
+       (some-> (not-empty end) (Long/parseLong))])))
+
+(defn get-object
+  [bucket object request {:keys [konserve cost-tracker]} request-id with-body?]
+  (sv/go-try sv/S
+    ($/-track-get-request! cost-tracker)
+    (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+      (if-let [versions (sv/<? sv/S (kp/-get-in konserve [:version-meta bucket object]))]
+        (let [params (keywordize-keys (uri/query->map (:query-string request)))]
+          (cond (some? (:acl params))
+                (as-> {:status 200
+                       :headers xml-content-type} r
+                      (if with-body?
+                        (assoc r :body [:AccessControlPolicy
+                                        [:Owner
+                                         [:ID "S4"]
+                                         [:DisplayName "You Know, for Data"]]
+                                        [:AccessControlList
+                                         [:Grant
+                                          [:Grantee {"xmlns:xsi" "http://www.w3.org/2001/XMLSchema-instance"
+                                                     "xsi:type" "CanonicalUser"}
+                                           [:ID "S4"]
+                                           [:DisplayName "You Know, for Data"]]
+                                          [:Permission "FULL_CONTROL"]]]])
+                        r))
+
+                (or (some? (:legal-hold params))
+                    (some? (:retention params))
+                    (some? (:torrent params))
+                    (some? (:tagging params)))
+                (as-> {:status 501
+                       :headers xml-content-type} r
+                      (if with-body?
+                        (assoc r :body [:Error
+                                        [:Code "NotImplemented"]
+                                        [:Resource (str \/ bucket \/ object)]
+                                        [:RequestId request-id]])
+                        r))
+
+                :else
+                (if-let [version (let [v (if-let [version-id (:versionId params)]
+                                           (first (filter #(= version-id (:version-id %)) versions))
+                                           (first versions))]
+                                   (log/debug :task ::get-object :phase :got-version :version v)
+                                   v)]
+                  (if (:deleted? version)
+                    (as-> {:status 404
+                           :headers (as-> xml-content-type h
+                                          (if (some? (:versioning existing-bucket))
+                                            (assoc h "x-amz-version-id" (or (:version-id version) "null")
+                                                     "x-amz-delete-marker" "true")
+                                            h))} r
+                          (if with-body?
+                            (assoc r :body [:Error
+                                            [:Code "NoSuchKey"]
+                                            [:Resource (str \/ bucket \/ object)]
+                                            [:RequestId request-id]])
+                            r))
+                    (let [if-modified-since (some-> (get-in request [:headers "if-modified-since"]) parse-date-header)
+                          if-unmodified-since (some-> (get-in request [:headers "if-unmodified-since"]) parse-date-header)
+                          if-match (get-in request [:headers "if-match"])
+                          if-none-match (get-in request [:headers "if-none-match"])
+                          content-type (or (:response-content-type params)
+                                           (:content-type version))
+                          headers (as-> {"content-type" content-type
+                                         "last-modified" (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (:created version))
+                                         "accept-ranges" "bytes"} h
+                                        (if-let [etag (:etag version)]
+                                          (assoc h "etag" etag)
+                                          h)
+                                        (if-let [v (:response-content-language params)]
+                                          (assoc h "content-language" v)
+                                          h)
+                                        (if-let [v (:response-expires params)]
+                                          (assoc h "expires" v)
+                                          h)
+                                        (if-let [v (:response-cache-control params)]
+                                          (assoc h "cache-control" v)
+                                          h)
+                                        (if-let [v (:response-content-disposition params)]
+                                          (assoc h "content-disposition" v)
+                                          h)
+                                        (if-let [v (:response-content-encoding params)]
+                                          (assoc h "content-encoding" v)
+                                          h)
+                                        (if (= "Enabled" (:versioning existing-bucket))
+                                          (assoc h "x-amz-version-id" (or (:version-id version) "null"))
+                                          h))
+                          range (some-> (get-in request [:headers "range"]) parse-range)]
+                      (log/debug :task ::get-object :phase :checking-object :version version
+                                 :if-modified-since if-modified-since
+                                 :if-unmodified-since if-unmodified-since
+                                 :if-match if-match
+                                 :if-none-match if-none-match)
+                      (cond (and (some? if-modified-since)
+                                 (pos? (compare if-modified-since (:created version))))
+                            {:status  304
+                             :headers headers}
+
+                            (and (some? if-unmodified-since)
+                                 (pos? (compare (:created version) if-unmodified-since)))
+                            {:status  412
+                             :headers headers}
+
+                            (and (some? if-match)
+                                 (not= if-match (:etag version)))
+                            {:status  412
+                             :headers headers}
+
+                            (and (some? if-none-match)
+                                 (= if-none-match (:etag version)))
+                            {:status  304
+                             :headers headers}
+
+                            (and (some? range)
+                                 (or (and (some? (second range)) (> (first range) (second range)))
+                                     (> (first range) (:content-length version))
+                                     (and (some? (second range)) (> (second range) (:content-length version)))))
+                            {:status  416
+                             :headers headers}
+
+                            (and (some? range)
+                                 (or (pos? (first range))
+                                     (and (some? (second range))
+                                          (not= (second range) (:content-length version)))))
+                            (let [range [(first range) (or (second range) (:content-length version))]
+                                  response {:status  206
+                                            :headers (assoc headers
+                                                       "content-range" (str "bytes " (first range) \- (second range) \/ (:content-length version)))}]
+                              (if with-body?
+                                (let [content (or (sv/<? sv/S (kp/-get-in konserve [:blobs bucket (:blob-id version)])) (byte-array 0))]
+                                  ($/-track-data-out! cost-tracker (- (second range) (first range)))
+                                  (assoc response :body (ByteArrayInputStream. content (first range) (- (second range) (first range)))))
+                                response))
+
+                            :else
+                            (let [response {:status 200
+                                            :headers headers}]
+                              (if with-body?
+                                (let [content (or (sv/<? sv/S (kp/-get-in konserve [:blobs bucket (:blob-id version)])) (byte-array 0))]
+                                  ($/-track-data-out! cost-tracker (:content-length version))
+                                  (assoc response :body (ByteArrayInputStream. content)))
+                                response)))))
+
+                  (as-> {:status 404
+                         :headers xml-content-type} r
+                        (if with-body?
+                          (assoc r :body [:Error
+                                          [:Code "NoSuchVersion"]
+                                          [:Resource (str \/ bucket \/ object)]
+                                          [:RequestId request-id]])
+                          r)))))
+        (as-> {:status 404
+               :headers xml-content-type} r
+              (if with-body?
+                (assoc r :body [:Error
+                                [:Code "NoSuchKey"]
+                                [:Resource (str \/ bucket \/ object)]
+                                [:RequestId request-id]])
+                r)))
+      (as-> {:status 404
+             :headers xml-content-type} r
+            (if with-body?
+              (assoc r :body [:Error
+                              [:Code "NoSuchBucket"]
+                              [:Resource (str \/ bucket \/ object)]
+                              [:RequestId request-id]])
+              r)))))
 
 (defn s3-handler
-  [{:keys [konserve hostname request-counter cost-tracker]}]
+  [{:keys [konserve hostname request-id-prefix request-counter cost-tracker] :as system}]
   (fn [request respond error]
     (async/go
-      (let [request-id (format "%016x" (swap! request-counter inc))]
+      (let [request-id (str request-id-prefix (format "%016x" (swap! request-counter inc)))]
         (try
           (log/debug :task ::s3-handler :phase :begin :request (pr-str request))
           (let [respond (fn respond-wrapper
@@ -52,7 +805,27 @@
                                        (assoc-in response [:headers "x-amz-request-id"] request-id)
                                        :body body))))
                 [bucket object] (read-bucket-object request hostname)]
+            (log/debug :task ::s3-handler :bucket bucket :object object)
             (case (:request-method request)
+              :head (cond (and (not-empty bucket)
+                               (empty? object))
+                          (do
+                            ($/-track-get-request! cost-tracker)
+                            (if (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))
+                              (respond {:status 200})
+                              (respond {:status 404})))
+
+                          (and (not-empty bucket)
+                               (not-empty object))
+                          (do
+                            ($/-track-get-request! cost-tracker)
+                            (respond (sv/<? sv/S (get-object bucket object request system request-id false))))
+
+                          :else
+                          (do
+                            ($/-track-get-request! cost-tracker)
+                            (respond {:status 200})))
+
               :get (cond (empty? bucket)
                          (let [buckets (sv/<? sv/S (kp/-get-in konserve [:bucket-meta]))
                                buckets-response [:ListAllMyBucketsResult {:xmlns "http://s3.amazonaws.com/doc/2006-03-01"}
@@ -71,147 +844,18 @@
                                      :body buckets-response}))
 
                          (empty? object)
-                         (let [params (keywordize-keys (uri/query->map (:query-string request)))]
-                           (log/debug :task ::s3-handler :phase :get-bucket-request :bucket bucket :params params)
-                           (if-let [existing-bucket (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
-                             (cond
-                               (= "2" (:list-type params))
-                               (do
-                                 ($/-track-put-request! cost-tracker)
-                                 (respond {:status 501
-                                           :headers xml-content-type
-                                           :body [:Error {}
-                                                  [:Code {} "NotImplemented"]
-                                                  [:Resource {} (str \/ bucket)]
-                                                  [:RequestId {} request-id]]}))
+                         (respond (sv/<? sv/S (bucket-get-ops bucket request system request-id)))
 
-                               (some? (:accelerate params))
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 200
-                                           :headers xml-content-type
-                                           :body [:AccelerateConfiguration {:xmlns "http://s3.amazonaws.com/doc/2006-03-01/"}
-                                                  [:Status {} "Suspended"]]}))
-
-                               (some? (:cors params))
-                               (let [cors (:cors existing-bucket)]
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 200
-                                           :headers xml-content-type
-                                           :body [:CORSConfiguration {}
-                                                  (map (fn [{:keys [header origin method max-age expose-header]}]
-                                                         [:CORSRule {}
-                                                          (concat
-                                                            (map (fn [header] [:AllowedHeader {} header]) header)
-                                                            (map (fn [origin] [:AllowedOrigin {} origin]) origin)
-                                                            (map (fn [method] [:AllowedMethod {} method]) method)
-                                                            (map (fn [max-age] [:MaxAgeSeconds {} max-age]) max-age)
-                                                            (map (fn [header] [:ExposeHeader {} header]) expose-header))])
-                                                       cors)]}))
-
-                               (some? (:encryption params)) ; todo maybe support this?
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 404
-                                           :headers xml-content-type
-                                           :body [:Error {}
-                                                  [:Code {} "ServerSideEncryptionConfigurationNotFoundError"]
-                                                  [:Resource (str \/ bucket)]
-                                                  [:RequestId request-id]]}))
-
-                               (some? (:acl params)) ; todo maybe support this?
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 200
-                                           :headers xml-content-type
-                                           :body [:AccessControlPolicy {}
-                                                  [:Owner {}
-                                                   [:ID {} "S4"]
-                                                   [:DisplayName {} "You Know, for Data"]]
-                                                  [:AccessControlList {}
-                                                   [:Grant
-                                                    [:Grantee {"xmlns:xsi" "http://www.w3.org/2001/XMLSchema-instance"
-                                                               "xsi:type" "CanonicalUser"}
-                                                     [:ID {} "S4"]
-                                                     [:DisplayName {} "You Know, for Data"]]
-                                                    [:Permission {} "FULL_CONTROL"]]]]}))
-
-                               (some? (:inventory params))
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 200
-                                           :headers xml-content-type
-                                           :body [:InventoryConfiguration {}]}))
-
-                               (some? (:lifecycle params))
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 404
-                                           :headers xml-content-type
-                                           :body [:Error {}
-                                                  [:Code {} "NoSuchLifecycleConfiguration"]
-                                                  [:Resource {} (str \/ bucket)]
-                                                  [:RequestId {} request-id]]}))
-
-                               (some? (:location params))
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 200
-                                           :headers xml-content-type
-                                           :body [:LocationConstraint {}]}))
-
-                               (some? (:publicAccessBlock params))
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 404
-                                           :headers xml-content-type
-                                           :body [:Error {}
-                                                  [:Code {} "NoSuchPublicAccessBlockConfiguration"]
-                                                  [:Resource {} (str \/ bucket)]
-                                                  [:RequestId {} request-id]]}))
-
-                               :else
-                               (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 501
-                                           :headers xml-content-type
-                                           :body [:Error {}
-                                                  [:Code {} "NotImplemented"]
-                                                  [:Resource {} (str \/ bucket)]
-                                                  [:RequestId {} request-id]]})))
-                             (do
-                               ($/-track-get-request! cost-tracker)
-                               (respond {:status 404
-                                         :headers xml-content-type
-                                         :body [:Error {}
-                                                [:Code {} "NoSuchBucket"]
-                                                [:Resource {} (str \/ bucket)]
-                                                [:RequestId {} request-id]]}))))
-
-                         :else (do
-                                 ($/-track-get-request! cost-tracker)
-                                 (respond {:status 501
-                                           :headers xml-content-type
-                                           :body [:Error {}
-                                                  [:Code {} "NotImplemented"]
-                                                  [:Resource {} (:uri request)]
-                                                  [:RequestId {} request-id]]})))
+                         :else
+                         (respond (sv/<? sv/S (get-object bucket object request system request-id true))))
 
               :put (do
                      ($/-track-put-request! cost-tracker)
                      (cond (and (not-empty bucket) (empty? object))
-                           (if-let [existing-bucket (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
-                             (respond {:status 409
-                                       :headers xml-content-type
-                                       :body [:Error {}
-                                              [:Code {} "BucketAlreadyExists"]
-                                              [:Resource {} (str \/ bucket)]
-                                              [:RequestId {} request-id]]})
-                             (do
-                               (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket] {:created (ZonedDateTime/now auth/UTC)
-                                                                                         :object-count 0}))
-                               (respond {:status 200
-                                         :headers {"location" (str \/ bucket)}})))
+                           (respond (sv/<? sv/S (bucket-put-ops bucket request system request-id)))
+
+                           (and (not-empty bucket) (not-empty object))
+                           (respond (sv/<? sv/S (put-object bucket object request system request-id)))
 
                            :else (respond {:status 501
                                            :headers xml-content-type
@@ -232,7 +876,7 @@
               :delete (do
                         ($/-track-get-request! cost-tracker)
                         (cond (and (not-empty bucket) (empty? object))
-                              (if-let [bucket-meta (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
+                              (if-let [bucket-meta (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
                                 (if (pos? (:object-count bucket-meta 0))
                                   (respond {:status 409
                                             :headers xml-content-type
@@ -241,9 +885,10 @@
                                                    [:Resource {} (str \/ bucket)]
                                                    [:RequestId {} request-id]]})
                                   (do
-                                    (sv/<? sv/S (kp/-dissoc konserve [:paths bucket])) ; note, these are actual vectors, not key-paths.
-                                    (sv/<? sv/S (kp/-dissoc konserve [:objects bucket]))
+                                    (sv/<? sv/S (kp/-update-in konserve [:paths] #(dissoc % bucket)))
+                                    (sv/<? sv/S (kp/-update-in konserve [:blobs] #(dissoc % bucket)))
                                     (sv/<? sv/S (kp/-update-in konserve [:bucket-meta] #(dissoc % bucket)))
+                                    (sv/<? sv/S (kp/-update-in konserve [:version-meta] #(dissoc % bucket)))
                                     (respond {:status 204})))
                                 (respond {:status 404
                                           :headers xml-content-type
@@ -253,7 +898,7 @@
                                                  [:RequestId {} request-id]]}))
 
                               (and (not-empty bucket) (not-empty object))
-                              (if-let [bucket-meta (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
+                              (if-let [bucket-meta (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
                                 (respond {:status 501})
                                 (respond {:status 404
                                           :headers xml-content-type
@@ -279,6 +924,7 @@
                                  [:Resource {} (:uri request)]
                                  [:RequestId {} request-id]]}))))
           (catch Exception x
+            (log/warn x "exception in S3 handler")
             (respond {:status 500
                       :headers xml-content-type
                       :body [:Error {}

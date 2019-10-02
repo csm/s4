@@ -8,11 +8,10 @@
             [superv.async :as sv]
             [clojure.tools.logging :as log])
   (:import [java.time ZonedDateTime ZoneId LocalDateTime]
-           [java.time.format DateTimeFormatter DateTimeParseException DateTimeFormatterBuilder SignStyle ResolverStyle]
+           [java.time.format DateTimeFormatter DateTimeParseException DateTimeFormatterBuilder SignStyle]
            [javax.crypto Mac]
            [javax.crypto.spec SecretKeySpec]
            [java.time.temporal ChronoField]
-           [java.time.chrono IsoChronology]
            [java.security MessageDigest]))
 
 (defn hex
@@ -32,8 +31,7 @@
       (println (-> (:query-string request) (uri/query->map) (uri/map->query)))
       (println))
     (let [headers (->> (:headers request)
-                       (filter #(or (#{"host" "content-type"} (key %))
-                                    (signed-headers (key %))
+                       (filter #(or (signed-headers (key %))
                                     (string/starts-with? (key %) "x-amz-")))
                        (sort-by first))]
       (doseq [[header-name header-value] headers]
@@ -186,6 +184,15 @@
                         (ZonedDateTime/of UTC)))))))))
 
 (def +debug+ true)
+
+(when +debug+
+  (defmethod print-method (type (byte-array 0))
+    [this w]
+    (.write w "#bytes\"")
+    (doseq [b this]
+      (.write w (format "%02x" b)))
+    (.write w "\"")))
+
 (defn- debug
   [tag value]
   (when +debug+
