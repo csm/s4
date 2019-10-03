@@ -184,7 +184,7 @@
                         (LocalDateTime/from)
                         (ZonedDateTime/of UTC)))))))))
 
-(def +debug+ true)
+(def +debug+ (= "true" (System/getProperty "s4.auth.debug")))
 
 (when +debug+
   (defmethod print-method (type (byte-array 0))
