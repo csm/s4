@@ -1019,7 +1019,7 @@
 
                                             (not-empty new)
                                             (respond {:status 204
-                                                      :headers {"x-amz-version-id" (:version-id (first new))
+                                                      :headers {"x-amz-version-id" (or (:version-id (first new)) "null")
                                                                 "x-amz-delete-marker" "true"}})
 
                                             :else

@@ -22,11 +22,12 @@
   [request signed-headers]
   (with-out-str
     (println (-> (get request :request-method "GET") name string/upper-case))
-    (println (-> (:uri request)))
-                 ;(.split "/")
-                 ;(->> (map uri/uri-encode)
-                 ;     (string/join \/))
-                 ;(as-> uri (if (= \/ (first uri)) uri (str \/ uri)))))
+    (println (-> (:uri request)
+                 (uri/uri-decode)
+                 (.split "/")
+                 (->> (map uri/uri-encode)
+                      (string/join \/))
+                 (as-> uri (if (= \/ (first uri)) uri (str \/ uri)))))
     (if (:query-string request)
       (println (-> (:query-string request) (uri/query->map) (uri/map->query)))
       (println))
