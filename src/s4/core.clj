@@ -13,8 +13,9 @@
             [s4.$$$$ :as $]
             [s4.auth :as auth]
             [superv.async :as sv]
-            [konserve.serializers :as ser])
-  (:import [java.time ZonedDateTime ZoneId Instant ZoneOffset]
+            [konserve.serializers :as ser]
+            [clojure.set :as set])
+  (:import [java.time ZonedDateTime ZoneId Instant ZoneOffset Clock]
            [java.time.format DateTimeFormatter DateTimeParseException]
            [java.nio ByteBuffer]
            [java.security SecureRandom MessageDigest]
@@ -67,15 +68,15 @@
   (let [host-header (get-in request [:headers "host"])]
     (if (and (string/ends-with? host-header hostname)
              (not= host-header hostname))
-      [(.substring (get-in request [:headers "host"]) 0 (- (count host-header) (count hostname) 1))
-       (drop-leading-slashes (:uri request))]
-      (vec (.split (drop-leading-slashes (:uri request)) "/" 2)))))
+      [(uri/uri-decode (.substring (get-in request [:headers "host"]) 0 (- (count host-header) (count hostname) 1)))
+       (uri/uri-decode (drop-leading-slashes (:uri request)))]
+      (vec (map uri/uri-decode (.split (drop-leading-slashes (:uri request)) "/" 2))))))
 
 (def xml-content-type {"content-type" "application/xml"})
 (def s3-xmlns "http://s3.amazonaws.com/doc/2006-03-01/")
 
 (defn bucket-put-ops
-  [bucket request {:keys [konserve]} request-id]
+  [bucket request {:keys [konserve clock]} request-id]
   (sv/go-try sv/S
     (let [params (keywordize-keys (uri/query->map (:query-string request)))]
       (if (empty? params)
@@ -87,7 +88,7 @@
                   [:Resource (str \/ bucket)]
                   [:RequestId request-id]]}
           (do
-            (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket] {:created (ZonedDateTime/now auth/UTC)
+            (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket] {:created (ZonedDateTime/now clock)
                                                                       :object-count 0}))
             (sv/<? sv/S (kp/-assoc-in konserve [:version-meta bucket] (sorted-map)))
             {:status 200
@@ -637,7 +638,7 @@
 (def random (SecureRandom.))
 
 (defn put-object
-  [bucket object request {:keys [konserve cost-tracker]} request-id]
+  [bucket object request {:keys [konserve cost-tracker clock]} request-id]
   (sv/go-try sv/S
     (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
       (let [blob-id (let [b (byte-array 16)
@@ -662,7 +663,7 @@
                                      (cons
                                        {:blob-id        blob-id
                                         :version-id     version-id
-                                        :created        (ZonedDateTime/now ^ZoneId auth/UTC)
+                                        :created        (ZonedDateTime/now clock)
                                         :etag           (str \" etag \")
                                         :content-type   content-type
                                         :content-length (count content)}
@@ -762,7 +763,8 @@
                                            (:content-type version))
                           headers (as-> {"content-type" content-type
                                          "last-modified" (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (:created version))
-                                         "accept-ranges" "bytes"} h
+                                         "accept-ranges" "bytes"
+                                         "content-length" (:content-length version)} h
                                         (if-let [etag (:etag version)]
                                           (assoc h "etag" etag)
                                           h)
@@ -866,7 +868,7 @@
               r)))))
 
 (defn s3-handler
-  [{:keys [konserve hostname request-id-prefix request-counter cost-tracker] :as system}]
+  [{:keys [konserve hostname request-id-prefix request-counter cost-tracker clock] :as system}]
   (fn [request respond error]
     (async/go
       (let [request-id (str request-id-prefix (format "%016x" (swap! request-counter inc)))]
@@ -998,17 +1000,24 @@
                                                                                    (.encodeToString (Base64/getUrlEncoder) b))]
                                                                   (cons {:version-id    version-id
                                                                          :deleted?      true
-                                                                         :last-modified (ZonedDateTime/now ZoneOffset/UTC)}
+                                                                         :last-modified (ZonedDateTime/now clock)}
                                                                         versions))
 
                                                                 (:deleted? (first versions))
                                                                 versions
 
+                                                                (and (<= (count versions) 1)
+                                                                     (not= "Enabled" (:versioning bucket-meta)))
+                                                                nil
+
                                                                 :else
                                                                 (cons {:version-id    nil
                                                                        :deleted?      true
-                                                                       :last-modified (ZonedDateTime/now ZoneOffset/UTC)}
+                                                                       :last-modified (ZonedDateTime/now clock)}
                                                                       (remove #(nil? (:version-id %)) versions))))))]
+                                      (when-let [deleted-version (first (set/difference (set old) (set new)))]
+                                        (when-let [blob-id (:blob-id deleted-version)]
+                                          (sv/<? sv/S (kp/-update-in konserve [:blobs bucket] #(dissoc % blob-id)))))
                                       (cond (some? versionId)
                                             (respond {:status 204
                                                       :headers (as-> {"x-amz-version-id" versionId}
@@ -1024,7 +1033,7 @@
 
                                             :else
                                             (respond {:status 204
-                                                      :headers (if (empty? old)
+                                                      :headers (if (or (empty? old) (nil? (:versioning bucket-meta)))
                                                                  {}
                                                                  {"x-amz-version-id" "null"})})))))
 
@@ -1101,6 +1110,8 @@
     Defaults to a `s4.auth/AtomAuthStore` instance.
   * `hostname` The hostname to assign the server, default \"localhost\".
   * `request-id-prefix` A string to prepend to request IDs. Default nil.
+  * `clock` A `java.time.Clock` to use for generating timestamps. Default
+    is `(java.time.Clock/systemUTC)`
 
   Return value is an atom, containing a map of keys:
 
@@ -1112,10 +1123,11 @@
   * `auth-store` The auth store instance. If you let this create the
     default store, you likely want to assoc your fake access keys into
     the atom contained by the AtomAuthStore."
-  [{:keys [bind-address port konserve cost-tracker reloadable? auth-store hostname request-id-prefix]
-    :or {bind-address "127.0.0.1"
-         port 0
-         hostname "localhost"}}]
+  [{:keys [bind-address port konserve cost-tracker reloadable? auth-store hostname request-id-prefix clock]
+    :or   {bind-address "127.0.0.1"
+           port         0
+           hostname     "localhost"
+           clock        (Clock/systemUTC)}}]
   (let [bind-addr (InetSocketAddress. bind-address port)
         konserve (or konserve (sv/<?? sv/S (km/new-mem-store)))
         cost-tracker (or cost-tracker ($/cost-tracker konserve))
@@ -1125,7 +1137,8 @@
                 :hostname hostname
                 :request-counter (atom 0)
                 :request-id-prefix request-id-prefix
-                :auth-store auth-store}
+                :auth-store auth-store
+                :clock clock}
         system-atom (atom system)
         handler (if reloadable?
                   (make-reloadable-handler system-atom)

@@ -13,6 +13,10 @@
                  [com.arohner/uri "0.1.2"]
                  [org.clojure/data.xml "0.2.0-alpha6"]]
   :profiles {:test {:dependencies [[ch.qos.logback/logback-classic "1.1.8"]
-                                   [ch.qos.logback/logback-core "1.1.8"]]
+                                   [ch.qos.logback/logback-core "1.1.8"]
+                                   [com.cognitect.aws/api "0.8.352"]
+                                   [com.cognitect.aws/endpoints "1.1.11.632"]
+                                   [com.cognitect.aws/s3 "726.2.488.0"]
+                                   [com.cognitect/anomalies "0.1.12"]]
                     :resource-paths ["test-resources"]}}
   :repl-options {:init-ns s4.repl})

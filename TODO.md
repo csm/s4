@@ -1,5 +1,6 @@
 # TODO
 
+* Multipart uploads.
 * Chunked uploads, and chunked request authentication.
 * Delete multiple objects.
 * Object tagging.
