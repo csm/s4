@@ -21,7 +21,7 @@
            [java.security SecureRandom MessageDigest]
            [java.util Base64 List]
            [com.google.common.io ByteStreams]
-           [java.io ByteArrayInputStream]
+           [java.io ByteArrayInputStream DataInputStream InputStream]
            [org.fressian.handlers ReadHandler WriteHandler]
            [clojure.lang PersistentTreeMap]
            [java.net InetSocketAddress]))
@@ -657,7 +657,9 @@
             content-type (get-in request [:headers "content-type"] "binary/octet-stream")]
         (when (some? content)
           ($/-track-data-in! cost-tracker (count content))
-          (sv/<? sv/S (kp/-assoc-in konserve [:blobs bucket blob-id] content)))
+          (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
+            (sv/<? sv/S (kp/-bassoc konserve [:blobs bucket blob-id] content))
+            (sv/<? sv/S (kp/-assoc-in konserve [[:blobs bucket blob-id]] content))))
         (sv/<? sv/S (kp/-update-in konserve [:version-meta bucket object]
                                    (fn [versions]
                                      (cons
@@ -698,6 +700,13 @@
     (when (some? begin)
       [(Long/parseLong begin)
        (some-> (not-empty end) (Long/parseLong))])))
+
+(defn unwrap-input-stream
+  [value]
+  (log/debug :task ::unwrap-input-stream :value value)
+  (cond (instance? InputStream value) value
+        (map? value) (recur (:input-stream value))
+        (bytes? value) (ByteArrayInputStream. value)))
 
 (defn get-object
   [bucket object request {:keys [konserve cost-tracker]} request-id with-body?]
@@ -828,18 +837,40 @@
                                             :headers (assoc headers
                                                        "content-range" (str "bytes " (first range) \- (second range) \/ (:content-length version)))}]
                               (if with-body?
-                                (let [content (or (sv/<? sv/S (kp/-get-in konserve [:blobs bucket (:blob-id version)])) (byte-array 0))]
-                                  ($/-track-data-out! cost-tracker (- (second range) (first range)))
-                                  (assoc response :body (ByteArrayInputStream. content (first range) (- (second range) (first range)))))
+                                (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
+                                  (let [content (async/promise-chan)]
+                                    ($/-track-data-out! cost-tracker (- (second range) (first range)))
+                                    (sv/<? sv/S
+                                      (kp/-bget konserve [:blobs bucket (:blob-id version)]
+                                        (fn [in] (async/thread
+                                                   (if-let [in (some-> (unwrap-input-stream in)
+                                                                       (ByteStreams/limit (second range))
+                                                                       (ByteStreams/skipFully (first range)))]
+                                                     (async/put! content in)
+                                                     (async/close! content))))))
+                                    (assoc response :body (sv/<? sv/S content)))
+                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve [[:blobs bucket (:blob-id version)]])) (byte-array 0))]
+                                    ($/-track-data-out! cost-tracker (- (second range) (first range)))
+                                    (assoc response :body (ByteArrayInputStream. content (first range) (- (second range) (first range))))))
                                 response))
 
                             :else
                             (let [response {:status 200
                                             :headers headers}]
                               (if with-body?
-                                (let [content (or (sv/<? sv/S (kp/-get-in konserve [:blobs bucket (:blob-id version)])) (byte-array 0))]
-                                  ($/-track-data-out! cost-tracker (:content-length version))
-                                  (assoc response :body (ByteArrayInputStream. content)))
+                                (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
+                                  (let [content (async/promise-chan)]
+                                    ($/-track-data-out! cost-tracker (:content-length version))
+                                    (sv/<? sv/S
+                                      (kp/-bget konserve [:blobs bucket (:blob-id version)]
+                                        (fn [in] (async/go
+                                                   (if-let [in (unwrap-input-stream in)]
+                                                     (async/put! content in)
+                                                     (async/close! content))))))
+                                    (assoc response :body (sv/<? sv/S content)))
+                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve [[:blobs bucket (:blob-id version)]])) (byte-array 0))]
+                                    ($/-track-data-out! cost-tracker (:content-length version))
+                                    (assoc response :body (ByteArrayInputStream. content))))
                                 response)))))
 
                   (as-> {:status 404
@@ -966,7 +997,6 @@
                                                    [:Resource {} (str \/ bucket)]
                                                    [:RequestId {} request-id]]})
                                   (do
-                                    (sv/<? sv/S (kp/-update-in konserve [:blobs] #(dissoc % bucket)))
                                     (sv/<? sv/S (kp/-update-in konserve [:bucket-meta] #(dissoc % bucket)))
                                     (sv/<? sv/S (kp/-update-in konserve [:version-meta] #(dissoc % bucket)))
                                     (respond {:status 204})))
@@ -1017,7 +1047,7 @@
                                                                       (remove #(nil? (:version-id %)) versions))))))]
                                       (when-let [deleted-version (first (set/difference (set old) (set new)))]
                                         (when-let [blob-id (:blob-id deleted-version)]
-                                          (sv/<? sv/S (kp/-update-in konserve [:blobs bucket] #(dissoc % blob-id)))))
+                                          (sv/<? sv/S (kp/-dissoc konserve [:blobs bucket blob-id]))))
                                       (cond (some? versionId)
                                             (respond {:status 204
                                                       :headers (as-> {"x-amz-version-id" versionId}
