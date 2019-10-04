@@ -7,18 +7,18 @@
             [s4.auth.protocols :as s4p]
             [superv.async :as sv]
             [clojure.tools.logging :as log])
-  (:import [java.time ZonedDateTime ZoneId LocalDateTime]
+  (:import [java.time ZonedDateTime ZoneId LocalDateTime ZoneOffset]
            [java.time.format DateTimeFormatter DateTimeParseException DateTimeFormatterBuilder SignStyle]
            [javax.crypto Mac]
            [javax.crypto.spec SecretKeySpec]
            [java.time.temporal ChronoField]
            [java.security MessageDigest]))
 
-(defn hex
+(defn ^:no-doc hex
   [b]
   (string/join (map #(format "%02x" %) b)))
 
-(defn canonical-request
+(defn ^:no-doc canonical-request
   [request signed-headers]
   (with-out-str
     (println (-> (get request :request-method "GET") name string/upper-case))
@@ -41,11 +41,11 @@
       (println (string/join \; (map first headers))))
     (print (get-in request [:headers "x-amz-content-sha256"]))))
 
-(def UTC (ZoneId/of "UTC"))
-(def datetime-formatter (DateTimeFormatter/ofPattern "yyyyMMdd'T'HHmmss'Z'"))
-(def date-formatter (DateTimeFormatter/ofPattern "yyyyMMdd"))
+(def ^:no-doc UTC ZoneOffset/UTC)
+(def ^:no-doc datetime-formatter (DateTimeFormatter/ofPattern "yyyyMMdd'T'HHmmss'Z'"))
+(def ^:no-doc date-formatter (DateTimeFormatter/ofPattern "yyyyMMdd"))
 
-(defn string-to-sign
+(defn ^:no-doc string-to-sign
   [^ZonedDateTime date region canonical-request-hash]
   (let [date (.withZoneSameInstant date UTC)]
     (with-out-str
@@ -54,19 +54,19 @@
       (println (str (.format date date-formatter) \/ region "/s3/aws4_request"))
       (print (hex canonical-request-hash)))))
 
-(defn hmac-256
+(defn ^:no-doc hmac-256
   [hkey content]
   (let [mac (Mac/getInstance "HmacSHA256")]
     (.init mac (SecretKeySpec. (byte-streams/to-byte-array hkey) "HMacSHA256"))
     (.doFinal mac (byte-streams/to-byte-array content))))
 
-(defn sha256
+(defn ^:no-doc sha256
   [content]
   (let [md (MessageDigest/getInstance "SHA-256")]
     (.update md (byte-streams/to-byte-array content))
     (.digest md)))
 
-(defn generate-signing-key
+(defn ^:no-doc generate-signing-key
   [region date secret-key]
   (let [date-key (hmac-256 (str "AWS4" secret-key) (.format (.withZoneSameInstant date UTC) date-formatter))
         date-region-key (hmac-256 date-key region)
@@ -84,7 +84,7 @@
                                    :auth-map/SignedHeaders
                                    :auth-map/Signature]))
 
-(defn parse-auth-header
+(defn ^:no-doc parse-auth-header
   [header]
   (when-let [[mech auth-str] (some-> header (.split " " 2))]
     (when (= (string/lower-case mech) "aws4-hmac-sha256")
@@ -103,69 +103,69 @@
                                        :request request})))
               (update :SignedHeaders #(vec (.split % ";")))))))))
 
-(def RFC-1036-FORMATTER (-> (DateTimeFormatterBuilder.)
-                            (.parseCaseInsensitive)
-                            (.parseLenient)
-                            (.optionalStart)
-                            (.appendText ChronoField/DAY_OF_WEEK {1 "Monday"
-                                                                  2 "Tuesday"
-                                                                  3 "Wednesday"
-                                                                  4 "Thursday"
-                                                                  5 "Friday"
-                                                                  6 "Saturday"
-                                                                  7 "Sunday"})
-                            (.appendLiteral ", ")
-                            (.optionalEnd)
-                            (.appendValue ChronoField/DAY_OF_MONTH 1 2 SignStyle/NOT_NEGATIVE)
-                            (.appendLiteral "-")
-                            (.appendText ChronoField/MONTH_OF_YEAR {1 "Jan"
-                                                                    2 "Feb"
-                                                                    3 "Mar"
-                                                                    4 "Apr"
-                                                                    5 "May"
-                                                                    6 "Jun"
-                                                                    7 "Jul"
-                                                                    8 "Aug"
-                                                                    9 "Sep"
-                                                                    10 "Oct"
-                                                                    11 "Nov"
-                                                                    12 "Dec"})
-                            (.appendLiteral "-")
-                            (.appendValue ChronoField/YEAR 2)
-                            (.appendLiteral " ")
-                            (.appendValue ChronoField/HOUR_OF_DAY 2)
-                            (.appendLiteral ":")
-                            (.appendValue ChronoField/MINUTE_OF_HOUR 2)
-                            (.appendLiteral ":")
-                            (.appendValue ChronoField/SECOND_OF_MINUTE 2)
-                            (.appendLiteral " ")
-                            (.appendOffset "+HHMM", "GMT")
-                            (.toFormatter)))
+(def ^:no-doc RFC-1036-FORMATTER (-> (DateTimeFormatterBuilder.)
+                                     (.parseCaseInsensitive)
+                                     (.parseLenient)
+                                     (.optionalStart)
+                                     (.appendText ChronoField/DAY_OF_WEEK {1 "Monday"
+                                                                           2 "Tuesday"
+                                                                           3 "Wednesday"
+                                                                           4 "Thursday"
+                                                                           5 "Friday"
+                                                                           6 "Saturday"
+                                                                           7 "Sunday"})
+                                     (.appendLiteral ", ")
+                                     (.optionalEnd)
+                                     (.appendValue ChronoField/DAY_OF_MONTH 1 2 SignStyle/NOT_NEGATIVE)
+                                     (.appendLiteral "-")
+                                     (.appendText ChronoField/MONTH_OF_YEAR {1 "Jan"
+                                                                             2 "Feb"
+                                                                             3 "Mar"
+                                                                             4 "Apr"
+                                                                             5 "May"
+                                                                             6 "Jun"
+                                                                             7 "Jul"
+                                                                             8 "Aug"
+                                                                             9 "Sep"
+                                                                             10 "Oct"
+                                                                             11 "Nov"
+                                                                             12 "Dec"})
+                                     (.appendLiteral "-")
+                                     (.appendValue ChronoField/YEAR 2)
+                                     (.appendLiteral " ")
+                                     (.appendValue ChronoField/HOUR_OF_DAY 2)
+                                     (.appendLiteral ":")
+                                     (.appendValue ChronoField/MINUTE_OF_HOUR 2)
+                                     (.appendLiteral ":")
+                                     (.appendValue ChronoField/SECOND_OF_MINUTE 2)
+                                     (.appendLiteral " ")
+                                     (.appendOffset "+HHMM", "GMT")
+                                     (.toFormatter)))
 
-(def ASCTIME-FORMATTER (-> (DateTimeFormatterBuilder.)
-                           (.parseCaseInsensitive)
-                           (.parseLenient)
-                           (.optionalStart)
-                           (.appendText ChronoField/DAY_OF_WEEK {1 "Mon"
-                                                                 2 "Tue"
-                                                                 3 "Wed"
-                                                                 4 "Thu"
-                                                                 5 "Fri"
-                                                                 6 "Sat"
-                                                                 7 "Sun"})
-                           (.appendLiteral " ")
-                           (.appendValue ChronoField/DAY_OF_MONTH 1 2 SignStyle/NOT_NEGATIVE)
-                           (.appendLiteral " ")
-                           (.appendValue ChronoField/HOUR_OF_DAY 2)
-                           (.appendLiteral ":")
-                           (.appendValue ChronoField/MINUTE_OF_HOUR 2)
-                           (.appendLiteral ":")
-                           (.appendValue ChronoField/SECOND_OF_MINUTE 2)
-                           (.appendLiteral " ")
-                           (.appendValue ChronoField/YEAR 4)
-                           (.toFormatter)))
+(def ^:no-doc ASCTIME-FORMATTER (-> (DateTimeFormatterBuilder.)
+                                   (.parseCaseInsensitive)
+                                   (.parseLenient)
+                                   (.optionalStart)
+                                   (.appendText ChronoField/DAY_OF_WEEK {1 "Mon"
+                                                                         2 "Tue"
+                                                                         3 "Wed"
+                                                                         4 "Thu"
+                                                                         5 "Fri"
+                                                                         6 "Sat"
+                                                                         7 "Sun"})
+                                   (.appendLiteral " ")
+                                   (.appendValue ChronoField/DAY_OF_MONTH 1 2 SignStyle/NOT_NEGATIVE)
+                                   (.appendLiteral " ")
+                                   (.appendValue ChronoField/HOUR_OF_DAY 2)
+                                   (.appendLiteral ":")
+                                   (.appendValue ChronoField/MINUTE_OF_HOUR 2)
+                                   (.appendLiteral ":")
+                                   (.appendValue ChronoField/SECOND_OF_MINUTE 2)
+                                   (.appendLiteral " ")
+                                   (.appendValue ChronoField/YEAR 4)
+                                   (.toFormatter)))
 
-(defn get-request-date
+(defn ^:no-doc get-request-date
   [request]
   (if-let [amz-date (get-in request [:headers "x-amz-date"])]
     (-> (.parse datetime-formatter amz-date)
@@ -184,7 +184,7 @@
                         (LocalDateTime/from)
                         (ZonedDateTime/of UTC)))))))))
 
-(def +debug+ (= "true" (System/getProperty "s4.auth.debug")))
+(def ^:no-doc +debug+ (= "true" (System/getProperty "s4.auth.debug")))
 
 (when +debug+
   (defmethod print-method (type (byte-array 0))
@@ -201,6 +201,11 @@
   value)
 
 (defn authenticating-handler
+  "Create an asynchronous ring handler that authenticates
+  requests before passing them on to `handler`.
+
+  The `auth-store` key should be a [[s4.auth.protocols/AuthStore]]
+  for resolving secret keys based on access keys."
   [handler {:keys [auth-store]}]
   (fn [request respond error]
     (async/go

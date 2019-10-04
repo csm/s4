@@ -1,4 +1,5 @@
 (ns s4.$$$$
+  "AWS cost estimator."
   (:require [clojure.core.async :as async]
             [konserve.protocols :as kp])
   (:import [java.util Date]))
@@ -20,7 +21,7 @@
     With a until-date (a java.util.Date), compute the request and transfer
     pricing, plus the storage costs from now until that date."))
 
-(defn compute-tiered-cost
+(defn ^:no-doc compute-tiered-cost
   [amount tiers]
   (if (zero? amount)
     0
@@ -70,14 +71,16 @@
   (-get-storage-used [_])
   (get-cost-estimate [_ _]))
 
-(def GB (* 1024 1024 1024))
-(def TB (* GB 1024))
-(def month (* 30 24 60 60 1000))
+(def ^:no-doc GB (* 1024 1024 1024))
+(def ^:no-doc TB (* GB 1024))
+(def ^:no-doc month (* 30 24 60 60 1000))
 
 ; example config for us-west-2 (Oregon), standard storage class,
 ; all transfer out to the Internet
 (with-precision 100
   (def us-west-2-standard
+    "Example configuration for us-west-2, with data transfer
+    out to the Internet."
     {:put-request (/ 0.0005M 1000)
      :get-request (/ 0.00004M 1000)
      :data-in [[Long/MAX_VALUE 0M]]
@@ -91,5 +94,11 @@
                [Long/MAX_VALUE (/ 0.021M GB month)]]}))
 
 (defn cost-tracker
+  "Create a cost tracker and estimator.
+
+  The `konserve` argument should be your konserve store.
+
+  The `cost-config` argument models costs for operations,
+  data transfer, and storage."
   ([konserve] (cost-tracker konserve us-west-2-standard))
   ([konserve cost-config] (->CostTracker (atom 0) (atom 0) (atom 0) (atom 0) konserve cost-config)))

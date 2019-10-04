@@ -3,30 +3,30 @@
             [cemerick.uri :as uri]
             [clojure.core.async :as async]
             [clojure.data.xml :as xml]
-            [clojure.data.xml.node :as node]
+            [clojure.set :as set]
             [clojure.string :as string]
             [clojure.tools.logging :as log]
             [clojure.walk :refer [keywordize-keys]]
             [konserve.memory :as km]
             [konserve.protocols :as kp]
+            [konserve.serializers :as ser]
             [manifold.deferred :as d]
             [s4.$$$$ :as $]
             [s4.auth :as auth]
-            [superv.async :as sv]
-            [konserve.serializers :as ser]
-            [clojure.set :as set])
-  (:import [java.time ZonedDateTime ZoneId Instant ZoneOffset Clock]
+            [superv.async :as sv])
+  (:import [java.time ZonedDateTime ZoneId Instant Clock]
            [java.time.format DateTimeFormatter DateTimeParseException]
            [java.nio ByteBuffer]
            [java.security SecureRandom MessageDigest]
            [java.util Base64 List UUID]
            [com.google.common.io ByteStreams]
-           [java.io ByteArrayInputStream DataInputStream InputStream]
+           [java.io ByteArrayInputStream InputStream]
            [org.fressian.handlers ReadHandler WriteHandler]
            [clojure.lang PersistentTreeMap]
            [java.net InetSocketAddress]))
 
 (def write-handlers
+  "Write handlers for fressian, for durable konserve stores."
   (atom {PersistentTreeMap
          {"sorted-map"
           (reify WriteHandler
@@ -42,6 +42,7 @@
               (.writeString wtr (.getId (.getZone ^ZonedDateTime t)))))}}))
 
 (def read-handlers
+  "Read handlers for fressian, for durable konserve stores."
   (atom {"sorted-map"
          (reify ReadHandler
            (read [_ rdr tag component-count]
@@ -72,10 +73,10 @@
        (uri/uri-decode (drop-leading-slashes (:uri request)))]
       (vec (map uri/uri-decode (.split (drop-leading-slashes (:uri request)) "/" 2))))))
 
-(def xml-content-type {"content-type" "application/xml"})
-(def s3-xmlns "http://s3.amazonaws.com/doc/2006-03-01/")
+(def ^:no-doc xml-content-type {"content-type" "application/xml"})
+(def ^:no-doc s3-xmlns "http://s3.amazonaws.com/doc/2006-03-01/")
 
-(defn bucket-put-ops
+(defn ^:no-doc bucket-put-ops
   [bucket request {:keys [konserve clock]} request-id]
   (sv/go-try sv/S
     (let [params (keywordize-keys (uri/query->map (:query-string request)))]
@@ -157,7 +158,7 @@
            :headers xml-content-type
            :body [:Error [:Code "NoSuchBucket"] [:Resource (str \/ bucket)] [:RequestId request-id]]})))))
 
-(defn list-objects-v2
+(defn ^:no-doc list-objects-v2
   [bucket bucket-meta request {:keys [konserve]} request-id]
   (sv/go-try sv/S
     (let [{:keys [delimiter encoding-type max-keys prefix continuation-token fetch-owner start-after]
@@ -218,7 +219,7 @@
        :headers xml-content-type
        :body response})))
 
-(defn list-versions
+(defn ^:no-doc list-versions
   [bucket bucket-meta request {:keys [konserve]} request-id]
   (sv/go-try sv/S
     (let [{:keys [delimiter encoding-type key-marker max-keys prefix version-id-marker]
@@ -306,7 +307,7 @@
        :headers xml-content-type
        :body result})))
 
-(defn list-objects
+(defn ^:no-doc list-objects
   [bucket bucket-meta request system request-id]
   (sv/go-try sv/S
     (let [request (update request :query-string
@@ -635,9 +636,9 @@
                   [:Resource {} (str \/ bucket)]
                   [:RequestId {} request-id]]})))))
 
-(def random (SecureRandom.))
+(def ^:no-doc random (SecureRandom.))
 
-(defn generate-blob-id
+(defn ^:no-doc generate-blob-id
   [bucket object]
   (let [uuid (UUID/nameUUIDFromBytes (.getBytes (pr-str [bucket object])))
         b (byte-array 32)
@@ -648,7 +649,7 @@
     (.putLong buf (.nextLong random))
     (.encodeToString (Base64/getEncoder) b)))
 
-(defn put-object
+(defn ^:no-doc put-object
   [bucket object request {:keys [konserve cost-tracker clock]} request-id]
   (sv/go-try sv/S
     (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
@@ -691,7 +692,7 @@
               [:Resource (str \/ bucket)]
               [:RequestId request-id]]})))
 
-(defn parse-date-header
+(defn ^:no-doc parse-date-header
   [d]
   (try
     (ZonedDateTime/parse d DateTimeFormatter/RFC_1123_DATE_TIME)
@@ -701,21 +702,21 @@
         (catch DateTimeParseException _
           (ZonedDateTime/parse d auth/ASCTIME-FORMATTER))))))
 
-(defn parse-range
+(defn ^:no-doc parse-range
   [r]
   (let [[begin end] (rest (re-matches #"bytes=([0-9]+)-([0-9]*)" r))]
     (when (some? begin)
       [(Long/parseLong begin)
        (some-> (not-empty end) (Long/parseLong))])))
 
-(defn unwrap-input-stream
+(defn ^:no-doc unwrap-input-stream
   [value]
   (log/debug :task ::unwrap-input-stream :value value)
   (cond (instance? InputStream value) value
         (map? value) (recur (:input-stream value))
         (bytes? value) (ByteArrayInputStream. value)))
 
-(defn get-object
+(defn ^:no-doc get-object
   [bucket object request {:keys [konserve cost-tracker]} request-id with-body?]
   (sv/go-try sv/S
     ($/-track-get-request! cost-tracker)
@@ -906,6 +907,16 @@
               r)))))
 
 (defn s3-handler
+  "Create an asynchronous Ring handler for the S3 API.
+
+  Keys in the argument map:
+
+  * `konserve` The konserve instance.
+  * `hostname` Your hostname, e.g. \"localhost\". This should match what your client sends.
+  * `request-id-prefix` A string to prepend to request IDs.
+  * `request-counter` An atom containing an int, used to generate request IDs.
+  * `cost-tracker` A [[s4.$$$$/ICostTracker]], for estimating costs.
+  * `clock` A `java.time.Clock` to use for generating timestamps."
   [{:keys [konserve hostname request-id-prefix request-counter cost-tracker clock] :as system}]
   (fn [request respond error]
     (async/go
@@ -1103,6 +1114,7 @@
                              [:RequestId {} request-id]]})))))))
 
 (defn aleph-async-ring-adapter
+  "Adapter function for using an async Ring handler with aleph."
   [async-handler]
   (fn [request]
     (let [response (d/deferred)]
@@ -1110,6 +1122,10 @@
       response)))
 
 (defn make-handler
+  "Make an asynchronous, authenticated S3 ring handler.
+
+  See [[s3-handler]] and [[s4.auth/authenticating-handler]]
+  for what keys should be in `system`."
   [system]
   (auth/authenticating-handler (s3-handler system) system))
 
