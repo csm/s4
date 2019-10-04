@@ -21,7 +21,7 @@ the backing store.
                   :endpoint-override {:protocol "http"
                                       :hostname "localhost"
                                       :port port}}))
-(
+(cognitect.aws.client.api/invoke s3-client {:op :ListBuckets})
 ```
 
 Includes:
