@@ -38,7 +38,15 @@
   (-track-data-out! [_ bytes] (swap! data-out + bytes))
   (-get-storage-used [_]
     (if-let [buckets (async/<!! (kp/-get-in konserve [:bucket-meta]))]
-      (reduce + 0 (remove nil? (map :total-bytes (vals buckets))))
+      (->> (keys buckets)
+           (map (fn [bucket]
+                  (->> (async/<!! (kp/-get-in konserve [:version-meta bucket]))
+                       (vals)
+                       (mapcat identity)
+                       (map :content-length)
+                       (remove nil?)
+                       (reduce + 0))))
+           (reduce + 0))
       0))
   (get-cost-estimate [this until-date]
     (let [base-costs {:put-requests (* @puts (get cost-config :put-request))

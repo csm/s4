@@ -75,12 +75,13 @@
              (async/close! ch) ch))))
 
 (require 's4.$$$$ :reload)
-(def cost-tracker (s4.$$$$/cost-tracker file-store))
+(def cost-tracker (s4.$$$$/cost-tracker mem-store))
 
-(swap! system assoc :konserve file-store)
+(swap! system assoc :konserve mem-store)
 (swap! system assoc :hostname "localhost")
 (swap! system assoc :request-counter (atom 0))
 (swap! system assoc :cost-tracker cost-tracker)
+(swap! system assoc :clock (java.time.Clock/systemUTC))
 
 (def handler (s4.core/make-reloadable-handler system))
 
@@ -156,4 +157,5 @@
                                    :Key (format "file%02x.txt" i)
                                    :Body (byte-array (repeat i (.byteValue i)))}}))
 
-(s4.$$$$/get-cost-estimate cost-tracker (java.util.Date.))
+(s4.$$$$/-get-storage-used cost-tracker)
+(s4.$$$$/get-cost-estimate cost-tracker (java.util.Date. (+ (System/currentTimeMillis))))

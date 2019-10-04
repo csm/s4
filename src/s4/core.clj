@@ -19,7 +19,7 @@
            [java.time.format DateTimeFormatter DateTimeParseException]
            [java.nio ByteBuffer]
            [java.security SecureRandom MessageDigest]
-           [java.util Base64 List]
+           [java.util Base64 List UUID]
            [com.google.common.io ByteStreams]
            [java.io ByteArrayInputStream DataInputStream InputStream]
            [org.fressian.handlers ReadHandler WriteHandler]
@@ -637,15 +637,22 @@
 
 (def random (SecureRandom.))
 
+(defn generate-blob-id
+  [bucket object]
+  (let [uuid (UUID/nameUUIDFromBytes (.getBytes (pr-str [bucket object])))
+        b (byte-array 32)
+        buf (ByteBuffer/wrap b)]
+    (.putLong buf (.getMostSignificantBits uuid))
+    (.putLong buf (.getLeastSignificantBits uuid))
+    (.putLong buf (System/currentTimeMillis))
+    (.putLong buf (.nextLong random))
+    (.encodeToString (Base64/getEncoder) b)))
+
 (defn put-object
   [bucket object request {:keys [konserve cost-tracker clock]} request-id]
   (sv/go-try sv/S
     (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
-      (let [blob-id (let [b (byte-array 16)
-                          buf (ByteBuffer/wrap b)]
-                      (.putLong buf (System/currentTimeMillis))
-                      (.putLong buf (.nextLong random))
-                      (.encodeToString (Base64/getUrlEncoder) b))
+      (let [blob-id (generate-blob-id bucket object)
             version-id (when (= "Enabled" (:versioning existing-bucket))
                          blob-id)
             content (some-> (:body request) (ByteStreams/toByteArray))
@@ -658,8 +665,8 @@
         (when (some? content)
           ($/-track-data-in! cost-tracker (count content))
           (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
-            (sv/<? sv/S (kp/-bassoc konserve [:blobs bucket blob-id] content))
-            (sv/<? sv/S (kp/-assoc-in konserve [[:blobs bucket blob-id]] content))))
+            (sv/<? sv/S (kp/-bassoc konserve blob-id content))
+            (sv/<? sv/S (kp/-assoc-in konserve blob-id content))))
         (sv/<? sv/S (kp/-update-in konserve [:version-meta bucket object]
                                    (fn [versions]
                                      (cons
@@ -841,7 +848,7 @@
                                   (let [content (async/promise-chan)]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
                                     (sv/<? sv/S
-                                      (kp/-bget konserve [:blobs bucket (:blob-id version)]
+                                      (kp/-bget konserve (:blob-id version)
                                         (fn [in] (async/thread
                                                    (if-let [in (some-> (unwrap-input-stream in)
                                                                        (ByteStreams/limit (second range))
@@ -849,7 +856,7 @@
                                                      (async/put! content in)
                                                      (async/close! content))))))
                                     (assoc response :body (sv/<? sv/S content)))
-                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve [[:blobs bucket (:blob-id version)]])) (byte-array 0))]
+                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
                                     (assoc response :body (ByteArrayInputStream. content (first range) (- (second range) (first range))))))
                                 response))
@@ -862,13 +869,13 @@
                                   (let [content (async/promise-chan)]
                                     ($/-track-data-out! cost-tracker (:content-length version))
                                     (sv/<? sv/S
-                                      (kp/-bget konserve [:blobs bucket (:blob-id version)]
+                                      (kp/-bget konserve (:blob-id version)
                                         (fn [in] (async/go
                                                    (if-let [in (unwrap-input-stream in)]
                                                      (async/put! content in)
                                                      (async/close! content))))))
                                     (assoc response :body (sv/<? sv/S content)))
-                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve [[:blobs bucket (:blob-id version)]])) (byte-array 0))]
+                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (:content-length version))
                                     (assoc response :body (ByteArrayInputStream. content))))
                                 response)))))
@@ -1023,11 +1030,7 @@
                                                                 (remove #(= versionId (:version-id %)) versions)
 
                                                                 (= "Enabled" (:versioning bucket-meta))
-                                                                (let [version-id (let [b (byte-array 16)
-                                                                                       buf (ByteBuffer/wrap b)]
-                                                                                   (.putLong buf (System/currentTimeMillis))
-                                                                                   (.putLong buf (.nextLong random))
-                                                                                   (.encodeToString (Base64/getUrlEncoder) b))]
+                                                                (let [version-id (generate-blob-id bucket object)]
                                                                   (cons {:version-id    version-id
                                                                          :deleted?      true
                                                                          :last-modified (ZonedDateTime/now clock)}
@@ -1047,7 +1050,7 @@
                                                                       (remove #(nil? (:version-id %)) versions))))))]
                                       (when-let [deleted-version (first (set/difference (set old) (set new)))]
                                         (when-let [blob-id (:blob-id deleted-version)]
-                                          (sv/<? sv/S (kp/-dissoc konserve [:blobs bucket blob-id]))))
+                                          (sv/<? sv/S (kp/-dissoc konserve blob-id))))
                                       (cond (some? versionId)
                                             (respond {:status 204
                                                       :headers (as-> {"x-amz-version-id" versionId}
