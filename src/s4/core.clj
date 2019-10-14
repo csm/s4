@@ -1,6 +1,5 @@
 (ns s4.core
-  (:require aleph.http
-            [cemerick.uri :as uri]
+  (:require [cemerick.uri :as uri]
             [clojure.core.async :as async]
             [clojure.data.xml :as xml]
             [clojure.set :as set]
@@ -10,10 +9,11 @@
             [konserve.memory :as km]
             [konserve.protocols :as kp]
             [konserve.serializers :as ser]
-            [manifold.deferred :as d]
             [s4.$$$$ :as $]
             [s4.auth :as auth]
-            [superv.async :as sv])
+            [superv.async :as sv]
+            [aleph.http :as http]
+            [s4.util :as util :refer [xml-content-type s3-xmlns]])
   (:import [java.time ZonedDateTime ZoneId Instant Clock]
            [java.time.format DateTimeFormatter DateTimeParseException]
            [java.nio ByteBuffer]
@@ -72,9 +72,6 @@
       [(uri/uri-decode (.substring (get-in request [:headers "host"]) 0 (- (count host-header) (count hostname) 1)))
        (uri/uri-decode (drop-leading-slashes (:uri request)))]
       (vec (map uri/uri-decode (.split (drop-leading-slashes (:uri request)) "/" 2))))))
-
-(def ^:no-doc xml-content-type {"content-type" "application/xml"})
-(def ^:no-doc s3-xmlns "http://s3.amazonaws.com/doc/2006-03-01/")
 
 (defn ^:no-doc bucket-put-ops
   [bucket request {:keys [konserve clock]} request-id]
@@ -781,7 +778,7 @@
                           headers (as-> {"content-type" content-type
                                          "last-modified" (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (:created version))
                                          "accept-ranges" "bytes"
-                                         "content-length" (:content-length version)} h
+                                         "content-length" (str (:content-length version))} h
                                         (if-let [etag (:etag version)]
                                           (assoc h "etag" etag)
                                           h)
@@ -1113,14 +1110,6 @@
                              [:Resource {} (:uri request)]
                              [:RequestId {} request-id]]})))))))
 
-(defn aleph-async-ring-adapter
-  "Adapter function for using an async Ring handler with aleph."
-  [async-handler]
-  (fn [request]
-    (let [response (d/deferred)]
-      (async-handler request (partial d/success! response) (partial d/error! response))
-      response)))
-
 (defn make-handler
   "Make an asynchronous, authenticated S3 ring handler.
 
@@ -1172,11 +1161,11 @@
   * `auth-store` The auth store instance. If you let this create the
     default store, you likely want to assoc your fake access keys into
     the atom contained by the AtomAuthStore."
-  [{:keys [bind-address port konserve cost-tracker reloadable? auth-store hostname request-id-prefix clock]
-    :or   {bind-address "127.0.0.1"
-           port         0
-           hostname     "localhost"
-           clock        (Clock/systemUTC)}}]
+  [{:keys [bind-address port konserve cost-tracker reloadable? auth-store hostname request-id-prefix clock jetty-options]
+    :or   {hostname     "localhost"
+           clock        (Clock/systemUTC)
+           bind-address "127.0.0.1"
+           port         0}}]
   (let [bind-addr (InetSocketAddress. bind-address port)
         konserve (or konserve (sv/<?? sv/S (km/new-mem-store)))
         cost-tracker (or cost-tracker ($/cost-tracker konserve))
@@ -1192,12 +1181,11 @@
         handler (if reloadable?
                   (make-reloadable-handler system-atom)
                   (make-handler system))
-        server (aleph.http/start-server (aleph-async-ring-adapter handler)
-                                        {:socket-address bind-addr})
-        server-port (aleph.netty/port server)]
+        server (http/start-server (util/aleph-async-ring-adapter handler)
+                                  {:socket-address bind-addr})]
     (swap! system-atom assoc
       :server server
-      :bind-address (InetSocketAddress. bind-address server-port))
+      :bind-address (InetSocketAddress. bind-address (aleph.netty/port server)))
     system-atom))
 
 (comment

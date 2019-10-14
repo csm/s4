@@ -1,76 +1,133 @@
 (ns s4.auth
-  (:require [byte-streams]
-            [cemerick.uri :as uri]
+  (:require [cemerick.uri :as uri]
             [clojure.string :as string]
             [clojure.core.async :as async]
             [clojure.spec.alpha :as s]
             [s4.auth.protocols :as s4p]
+            [s4.util :refer [hex sha256 hmac-256]]
             [superv.async :as sv]
             [clojure.tools.logging :as log])
-  (:import [java.time ZonedDateTime ZoneId LocalDateTime ZoneOffset]
+  (:import [java.time ZonedDateTime LocalDateTime ZoneOffset]
            [java.time.format DateTimeFormatter DateTimeParseException DateTimeFormatterBuilder SignStyle]
            [javax.crypto Mac]
            [javax.crypto.spec SecretKeySpec]
            [java.time.temporal ChronoField]
-           [java.security MessageDigest]))
+           [java.security MessageDigest]
+           [com.google.common.io ByteStreams]
+           [java.io ByteArrayInputStream InputStream]))
 
-(defn ^:no-doc hex
-  [b]
-  (string/join (map #(format "%02x" %) b)))
+(defn ^:no-doc split-path
+  "Similar to String.split, string/split, etc., but will
+  include empty parts at the *end* of the string."
+  [p]
+  (reduce (fn [state ch]
+            (cond
+              (= ch \/)
+              {:parts (conj (:parts state) (.toString (:buffer state)))
+               :buffer (StringBuilder.)}
+
+              (= ch ::end)
+              (conj (:parts state) (.toString (:buffer state)))
+
+              :else
+              (do
+                (.append (:buffer state) ch)
+                state)))
+          {:parts [] :buffer (StringBuilder.)}
+          (concat p [::end])))
+
+(defn ^:no-doc normalize-path
+  [parts]
+  (reduce
+    (fn [{:keys [parts prev] :as state} part]
+      (cond (and (= ::begin prev)
+                 (not= "." part))
+            {:parts (conj! parts part)
+             :prev part}
+
+            (and (= ::end part)
+                 (empty? (:prev state)))
+            (persistent! (conj! parts prev))
+
+            (and (= ::end part)
+                 (= ".." part))
+            (persistent! (pop! parts))
+
+            (= ::end part)
+            (persistent! parts)
+
+            (= ".." part)
+            {:parts (pop! parts)
+             :prev part}
+
+            (and (not= "." part)
+                 (not (empty? part)))
+            {:parts (conj! parts part)
+             :prev part}
+
+            :else (assoc state :prev part)))
+
+    {:parts (transient []) :prev ::begin}
+    (concat parts [::end])))
 
 (defn ^:no-doc canonical-request
-  [request signed-headers]
+  [request signed-headers content-sha256 service]
+  (log/debug "canonical-request" (pr-str request) signed-headers content-sha256 service "URI:" (get request :uri))
   (with-out-str
     (println (-> (get request :request-method "GET") name string/upper-case))
-    (println (-> (:uri request)
-                 (uri/uri-decode)
-                 (.split "/")
-                 (->> (map uri/uri-encode)
-                      (string/join \/))
-                 (as-> uri (if (= \/ (first uri)) uri (str \/ uri)))))
-    (if (:query-string request)
-      (println (-> (:query-string request) (uri/query->map) (uri/map->query)))
-      (println))
+    (if (= "s3" service)
+      (println (as-> (get request :uri) u
+                     (uri/uri-decode u)
+                     (split-path u)
+                     (map uri/uri-encode u)
+                     (string/join \/ u)))
+      (println (as-> (get request :uri) u
+                     (uri/uri-decode u)
+                     (split-path u)
+                     (normalize-path u)
+                     (map uri/uri-encode u)
+                     (map #(string/replace % "%7E" "~") u) ; for some reason, ~ isn't encoded by AWS?
+                     (string/join \/ u)
+                     (if (empty? u) "/" u))))
+    (if (string/blank? (:query-string request))
+      (println)
+      (println (-> (:query-string request)
+                   (string/split #"&")
+                   (seq)
+                   (->> (map uri/split-param)
+                        (map #(vec (map uri/uri-decode %))))
+                   (uri/map->query)
+                   (string/replace "%7E" "~"))))
     (let [headers (->> (:headers request)
                        (filter #(or (signed-headers (key %))
                                     (string/starts-with? (key %) "x-amz-")))
                        (sort-by first))]
       (doseq [[header-name header-value] headers]
-        (println (str header-name \: (string/trim header-value))))
+        (println (str header-name \: (-> (string/trim header-value)
+                                         (string/replace #"\s+" " ")))))
       (println)
       (println (string/join \; (map first headers))))
-    (print (get-in request [:headers "x-amz-content-sha256"]))))
+    (when content-sha256
+      (print content-sha256))))
 
 (def ^:no-doc UTC ZoneOffset/UTC)
 (def ^:no-doc datetime-formatter (DateTimeFormatter/ofPattern "yyyyMMdd'T'HHmmss'Z'"))
 (def ^:no-doc date-formatter (DateTimeFormatter/ofPattern "yyyyMMdd"))
 
 (defn ^:no-doc string-to-sign
-  [^ZonedDateTime date region canonical-request-hash]
+  [^ZonedDateTime date region canonical-request-hash service]
   (let [date (.withZoneSameInstant date UTC)]
     (with-out-str
       (println "AWS4-HMAC-SHA256")
       (println (.format date datetime-formatter))
-      (println (str (.format date date-formatter) \/ region "/s3/aws4_request"))
+      (println (str (.format date date-formatter) \/ region \/ service "/aws4_request"))
       (print (hex canonical-request-hash)))))
 
-(defn ^:no-doc hmac-256
-  [hkey content]
-  (let [mac (Mac/getInstance "HmacSHA256")]
-    (.init mac (SecretKeySpec. (byte-streams/to-byte-array hkey) "HMacSHA256"))
-    (.doFinal mac (byte-streams/to-byte-array content))))
-
-(defn ^:no-doc sha256
-  [content]
-  (let [md (MessageDigest/getInstance "SHA-256")]
-    (.update md (byte-streams/to-byte-array content))
-    (.digest md)))
-
 (defn ^:no-doc generate-signing-key
-  [region date secret-key]
-  (let [date-key (hmac-256 (str "AWS4" secret-key) (.format (.withZoneSameInstant date UTC) date-formatter))
+  [region date service secret-key]
+  (let [date-key (hmac-256 (str "AWS4" secret-key) date)
         date-region-key (hmac-256 date-key region)
-        date-region-service-key (hmac-256 date-region-key "s3")]
+        date-region-service-key (hmac-256 date-region-key service)]
     (hmac-256 date-region-service-key "aws4_request")))
 
 (s/def :auth-map/Credential (s/and string?
@@ -167,7 +224,9 @@
 
 (defn ^:no-doc get-request-date
   [request]
-  (if-let [amz-date (get-in request [:headers "x-amz-date"])]
+  (if-let [amz-date (some-> (get-in request [:headers "x-amz-date"])
+                            (string/split #",")
+                            (first))]
     (-> (.parse datetime-formatter amz-date)
         (LocalDateTime/from)
         (ZonedDateTime/of UTC))
@@ -213,17 +272,33 @@
       (try
         (if-let [auth-header (debug "parse-auth-header:" (parse-auth-header (get-in request [:headers "authorization"])))]
           (if-let [secret-access-key (debug "get-secret-access-key:" (sv/<?? sv/S (s4p/-get-secret-access-key auth-store (get-in auth-header [:Credential :access-key]))))]
-            (let [date (debug "get-request-date:" (get-request-date request))
-                  canon-req (debug "canonical-request:" (canonical-request request (set (:SignedHeaders auth-header))))
-                  s2s (debug "string-to-sign:" (string-to-sign date (get-in auth-header [:Credential :region]) (sha256 canon-req)))
-                  key (debug "generate-signing-key:" (generate-signing-key (get-in auth-header [:Credential :region]) date secret-access-key))
-                  mac (debug "mac:" (hex (hmac-256 key s2s)))]
-              (if (= mac (:Signature auth-header))
-                (handler request respond error)
-                (respond {:status 401})))
-            (respond {:status 401}))
-          (respond {:status 401}))
-        (catch Exception x (error x))))))
+            (let [body (debug "body:" (some-> (:body request) (ByteStreams/toByteArray)))
+                  body-sha256 (debug "content-sha256:" (-> (or body (byte-array 0)) sha256 hex))]
+              (if (and (some? (get-in request [:headers "x-amz-content-sha256"]))
+                       (not= body-sha256 (get-in request [:headers "x-amz-content-sha256"])))
+                (respond {:status 400})
+                (let [date (debug "get-request-date:" (get-request-date request))
+                      canon-req (debug "canonical-request:" (canonical-request request (set (:SignedHeaders auth-header)) body-sha256 (get-in auth-header [:Credential :service])))
+                      s2s (debug "string-to-sign:" (string-to-sign date (get-in auth-header [:Credential :region]) (sha256 canon-req) (get-in auth-header [:Credential :service])))
+                      key (debug "generate-signing-key:" (generate-signing-key (get-in auth-header [:Credential :region])
+                                                                               (get-in auth-header [:Credential :date])
+                                                                               (get-in auth-header [:Credential :service])
+                                                                               secret-access-key))
+                      mac (debug "mac:" (hex (hmac-256 key s2s)))]
+                  (if (= mac (:Signature auth-header))
+                    (handler (if (some? body)
+                               (assoc request :body (ByteArrayInputStream. body))
+                               request)
+                             respond error)
+                    (respond {:status 401
+                              :headers {"www-authenticate" "AWS4-HMAC-SHA256 realm=S4"}})))))
+            (respond {:status 401
+                      :headers {"www-authenticate" "AWS4-HMAC-SHA256 realm=S4"}}))
+          (respond {:status 401
+                    :headers {"www-authenticate" "AWS4-HMAC-SHA256 realm=S4"}}))
+        (catch Exception x
+          (log/error x "exception in authentication handler")
+          (error x))))))
 
 (defrecord AtomAuthStore [access-keys]
   s4p/AuthStore
