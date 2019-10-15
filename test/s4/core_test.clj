@@ -50,7 +50,8 @@
                                                                                      :secret-access-key secret-key})
                             :endpoint-override {:protocol "http"
                                                 :hostname "localhost"
-                                                :port *port*}})]
+                                                :port *port*}
+                            :region "us-west-2"})]
     (testing "that we can do bucket operations"
       (is (= {:Buckets [] :Owner {:ID "S4" :DisplayName "You Know, for Data"}}
              (aws/invoke client {:op :ListBuckets})))

@@ -1,6 +1,5 @@
 (ns s4.core
-  (:require aleph.http
-            [cemerick.uri :as uri]
+  (:require [cemerick.uri :as uri]
             [clojure.core.async :as async]
             [clojure.data.xml :as xml]
             [clojure.set :as set]
@@ -10,10 +9,15 @@
             [konserve.memory :as km]
             [konserve.protocols :as kp]
             [konserve.serializers :as ser]
-            [manifold.deferred :as d]
             [s4.$$$$ :as $]
             [s4.auth :as auth]
-            [superv.async :as sv])
+            [s4.sqs :as sqs]
+            [s4.sqs.queues :as queues]
+            [superv.async :as sv]
+            [aleph.http :as http]
+            [s4.util :as util :refer [xml-content-type s3-xmlns]]
+            [clojure.spec.alpha :as s]
+            [clojure.data.json :as json])
   (:import [java.time ZonedDateTime ZoneId Instant Clock]
            [java.time.format DateTimeFormatter DateTimeParseException]
            [java.nio ByteBuffer]
@@ -73,11 +77,131 @@
        (uri/uri-decode (drop-leading-slashes (:uri request)))]
       (vec (map uri/uri-decode (.split (drop-leading-slashes (:uri request)) "/" 2))))))
 
-(def ^:no-doc xml-content-type {"content-type" "application/xml"})
-(def ^:no-doc s3-xmlns "http://s3.amazonaws.com/doc/2006-03-01/")
+(s/def ::S3EventType #{"s3:ReducedRedundancyLostObject"
+                       "s3:ObjectCreated:*"
+                       "s3:ObjectCreated:Put"
+                       "s3:ObjectCreated:Post"
+                       "s3:ObjectCreated:Copy"
+                       "s3:ObjectCreated:CompleteMultipartUpload"
+                       "s3:ObjectRemoved:*"
+                       "s3:ObjectRemoved:Delete"
+                       "s3:ObjectRemoved:DeleteMarkerCreated"
+                       "s3:ObjectRestore:Post"
+                       "s3:ObjectRestore:Completed"})
+
+(s/def :QueueConfiguration/Event (s/coll-of ::S3EventType))
+
+(s/def ::FilterRuleName (fn [[k v]]
+                          (and (= :Name k)
+                               (#{"prefix" "suffix"} v))))
+(s/def ::FilterRuleValue (fn [[k v]]
+                           (and (= :Value k)
+                                (string? v))))
+(s/def ::FilterRule (fn [rule]
+                      (when-let [[k & args] rule]
+                        (and (= :FilterRule k)
+                             (= 2 (count args))
+                             (some #(s/valid? ::FilterRuleName %) args)
+                             (some #(s/valid? ::FilterRuleValue %) args)))))
+(s/def ::Filter (fn [f]
+                  (when-let [[k & rules] f]
+                    (and (= :S3Key k)
+                         (every? #(s/valid? ::FilterRule %) rules)))))
+
+(s/def :QueueConfiguration/Id string?)
+(s/def :QueueConfiguration/Queue string?)
+
+(s/def ::QueueConfiguration (s/coll-of (s/keys :req-un [:QueueConfiguration/Event
+                                                        :QueueConfiguration/Queue]
+                                               :opt-un [::Filter
+                                                        :QueueConfiguration/Id])))
+
+(s/def :TopicConfiguration/Event (s/coll-of ::S3EventType))
+(s/def :TopicConfiguration/Id string?)
+(s/def :TopicConfiguration/Topic string?)
+
+(s/def ::TopicConfiguration (s/coll-of (s/keys :req-un [:TopicConfiguration/Event
+                                                        :TopicConfiguration/Topic]
+                                               :opt-un [::Filter
+                                                        :TopicConfiguration/Id])))
+
+(s/def :LambdaFunctionConfiguration/Event (s/coll-of ::S3EventType))
+(s/def :LambdaFunctionConfiguration/Id string?)
+(s/def :LambdaFunctionConfiguration/CloudFunction string?)
+
+(s/def ::LambdaFunctionConfiguration (s/coll-of (s/keys :req-un [:LambdaFunctionConfiguration/Event
+                                                                 :LambdaFunctionConfiguration/CloudFunction]
+                                                        :opt-un [::Filter
+                                                                 :LambdaFunctionConfiguration/Id])))
+
+(s/def ::NotificationConfiguration (s/keys :opt-un [::QueueConfiguration
+                                                    ::TopicConfiguration
+                                                    ::LambdaFunctionConfiguration]))
+
+(defn ^:no-doc element->map
+  ([element] (element->map element
+                           (fn [content]
+                             (if-let [children (not-empty (filter xml/element? content))]
+                               (map element->map children)
+                               content))))
+  ([element value-fn]
+   (when (some? element)
+     {(:tag element) (value-fn (:content element))})))
+
+(defn ^:no-doc assoc-some
+  [m k v & kvs]
+  (let [m (if (some? v) (assoc m k v) m)]
+    (if-let [[k v & kvs] kvs]
+      (apply assoc-some m k v kvs)
+      m)))
+
+(defn ^:no-doc element-as-sexp
+  [element]
+  (vec (concat [(:tag element)]
+               (some-> (:attrs element) not-empty vector)
+               (if (some xml/element? (:content element))
+                 (map element-as-sexp (filter xml/element? (:content element)))
+                 (:content element)))))
+
+(defn ^:no-doc parse-notification-configuration
+  [xml]
+  (log/debug "parse-notification-configuration" (pr-str xml))
+  (if (= :NotificationConfiguration (:tag xml))
+    (let [config (->> (:content xml)
+                      (filter xml/element?)
+                      (reduce (fn [config element]
+                                (if-let [key (#{:QueueConfiguration :TopicConfiguration :CloudFunctionConfiguration} (:tag element))]
+                                  (merge-with concat config {key [(as-> {} conf
+                                                                        (assoc-some conf
+                                                                                    :Event
+                                                                                    (->> (:content element)
+                                                                                         (filter #(and (xml/element? %) (= :Event (:tag %))))
+                                                                                         (mapcat :content)
+                                                                                         not-empty))
+                                                                        (assoc-some conf
+                                                                                    :Filter
+                                                                                    (some->> (:content element)
+                                                                                             (filter #(and (xml/element? %) (= :Filter (:tag %))))
+                                                                                             (first)
+                                                                                             (:content)
+                                                                                             (filter xml/element?)
+                                                                                             (first)
+                                                                                             (element-as-sexp)))
+                                                                        (->> (:content element)
+                                                                             (filter #(and (xml/element? %) (#{:Id :Queue :Topic :CloudFunction} (:tag %))))
+                                                                             (mapcat #(vector (:tag %) (->> (:content %) (first))))
+                                                                             (apply assoc conf)))]})
+                                  (throw (IllegalArgumentException. "invalid notification configuration"))))
+                              {}))
+          _ (log/debug "config before conform:" (pr-str config))
+          config (s/conform ::NotificationConfiguration config)]
+      (if (= ::s/invalid config)
+        (throw (IllegalArgumentException. "invalid notification configuration"))
+        config))
+    (throw (IllegalArgumentException. "invalid notification configuration"))))
 
 (defn ^:no-doc bucket-put-ops
-  [bucket request {:keys [konserve clock]} request-id]
+  [bucket request {:keys [konserve clock sqs-server]} request-id]
   (sv/go-try sv/S
     (let [params (keywordize-keys (uri/query->map (:query-string request)))]
       (if (empty? params)
@@ -147,6 +271,34 @@
                           [:Code "MissingRequestBodyError"]
                           [:Resource (str \/ bucket)]
                           [:RequestId request-id]]})
+
+                (some? (:notification params))
+                (try
+                  (if-let [config (some-> (:body request) (xml/parse :namespace-aware false) (parse-notification-configuration))]
+                    (cond (or (not-empty (:TopicConfiguration config))
+                              (not-empty (:CloudFunctionConfiguration config)))
+                          (throw (IllegalArgumentException.))
+
+                          (not-empty (:QueueConfiguration config))
+                          (if-let [queue-metas (when (some? sqs-server)
+                                                 (->> (:QueueConfiguration config)
+                                                      (map #(kp/-get-in (-> sqs-server deref :konserve) [:queue-meta (:QueueArn %)]))
+                                                      (sv/<?* sv/S)))]
+                            (do
+                              (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket :notifications] (:QueueConfiguration config)))
+                              {:status 200})
+                            (throw (IllegalArgumentException.))))
+
+                    {:status 400
+                     :headers xml-content-type
+                     :body [:Error
+                            [:Code "MissingRequestBodyError"]
+                            [:Resource (str \/ bucket)]
+                            [:RequestId request-id]]})
+                  (catch IllegalArgumentException _
+                    {:status 400
+                     :headers xml-content-type
+                     :body [:Error [:Code "InvalidArgument"] [:Resource (str \/ bucket)] [:RequestId request-id]]}))
 
                 ; todo cors - too lazy to parse out the damn xml right now
 
@@ -464,9 +616,18 @@
           (some? (:notification params))
           (do
             ($/-track-get-request! cost-tracker)
-            {:status 200
-             :headers xml-content-type
-             :body [:NotificationConfiguration {:xmlns s3-xmlns}]})
+            (let [configs (:notifications existing-bucket)]
+              (log/debug "returning configs:" (pr-str configs))
+              {:status 200
+               :headers xml-content-type
+               :body (into [:NotificationConfiguration {:xmlns s3-xmlns}]
+                           (map (fn [conf]
+                                  (vec (concat [:QueueConfiguration]
+                                               (map (fn [event] [:Event event]) (:Event conf))
+                                               (some->> (:Filter conf) (vector :Filter) vector)
+                                               (some->> (:Id conf) (vector :Id) vector)
+                                               (some->> (:Queue conf) (vector :Queue) vector))))
+                                configs))}))
 
           (or (some? (:policyStatus params)) (some? (:policy params)))
           (do
@@ -649,8 +810,38 @@
     (.putLong buf (.nextLong random))
     (.encodeToString (Base64/getEncoder) b)))
 
+(defn ^:no-doc trigger-bucket-notification
+  [sqs-server notification-config notification]
+  (sv/go-try
+    sv/S
+    (when (some? sqs-server)
+      (doseq [config notification-config]
+        (when (or (and (= "ObjectCreated:Put" (get notification :eventName))
+                       (some #{"s3:ObjectCreated:Put" "s3:ObjectCreated:*"} (:Event config)))
+                  (and (= "ObjectRemoved:Delete" (get notification :eventName))
+                       (some #{"s3:ObjectRemoved:Delete" "s3:ObjectRemoved:*"} (:Event config)))
+                  (and (= "ObjectRemoved:DeleteMarkerCreated" (get notification :eventName))
+                       (some #{"s3:ObjectRemoved:DeleteMarkerCreated" "s3:ObjectRemoved:*"} (:Event config)))
+                  (every? (fn [rule]
+                            (let [name (second (first (filter #(= :Name (first %)) (rest rule))))
+                                  value (second (first (filter #(= :Value (first %)) (rest rule))))]
+                              (if (= "prefix" name)
+                                (string/starts-with? (get-in notification [:s3 :key]) value)
+                                (string/ends-with? (get-in notification [:s3 :key]) value))))
+                          (rest (:Filter config))))
+          (when-let [queue-meta (sv/<? sv/S (kp/-get-in (-> sqs-server deref :konserve) [:queue-meta (:Queue config)]))]
+            (let [queues (queues/get-queue (-> sqs-server deref :queues) (:Queue config))
+                  message-id (str (UUID/randomUUID))
+                  body (json/write-str {:Records [(if-let [id (:Id config)]
+                                                    (assoc-in notification [:s3 :configurationId] id)
+                                                    notification)]})
+                  body-md5 (util/hex (util/md5 body))]
+              (queues/offer! queues (queues/->Message message-id message-id body body-md5 {})
+                             (Integer/parseInt (get-in queue-meta [:attributes :DelaySeconds]))
+                             (Integer/parseInt (get-in queue-meta [:attributes :MessageRetentionPeriod]))))))))))
+
 (defn ^:no-doc put-object
-  [bucket object request {:keys [konserve cost-tracker clock]} request-id]
+  [bucket object request {:keys [konserve cost-tracker clock sqs-server]} request-id]
   (sv/go-try sv/S
     (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
       (let [blob-id (generate-blob-id bucket object)
@@ -662,7 +853,8 @@
                    (->> (.digest md)
                         (map #(format "%02x" %))
                         (string/join)))
-            content-type (get-in request [:headers "content-type"] "binary/octet-stream")]
+            content-type (get-in request [:headers "content-type"] "binary/octet-stream")
+            created (ZonedDateTime/now clock)]
         (when (some? content)
           ($/-track-data-in! cost-tracker (count content))
           (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
@@ -680,6 +872,24 @@
                                        (if (= "Enabled" (:versioning existing-bucket))
                                          versions
                                          (vec (filter #(= version-id (:version-id %)) versions)))))))
+        (sv/<? sv/S (trigger-bucket-notification sqs-server (:notifications existing-bucket)
+                                                 {:eventVersion "2.1"
+                                                  :eventSource "aws:s3"
+                                                  :awsRegion "s4"
+                                                  :eventTime (.format created DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                  :eventName "ObjectCreated:Put"
+                                                  :userIdentity {:principalId "S4"}
+                                                  :requestParameters {:sourceIPAddress (:remote-addr request)}
+                                                  :responseElements {:x-amz-request-id request-id}
+                                                  :s3 {:s3SchemaVersion "1.0"
+                                                       :bucket {:name bucket
+                                                                :ownerIdentity {:principalId "S4"}
+                                                                :arn bucket}
+                                                       :object {:key object
+                                                                :size (count content)
+                                                                :eTag etag
+                                                                :versionId (or version-id "null")
+                                                                :sequencer "00"}}}))
         {:status 200
          :headers (as-> {"ETag" etag} h
                         (if (some? version-id)
@@ -781,7 +991,7 @@
                           headers (as-> {"content-type" content-type
                                          "last-modified" (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (:created version))
                                          "accept-ranges" "bytes"
-                                         "content-length" (:content-length version)} h
+                                         "content-length" (str (:content-length version))} h
                                         (if-let [etag (:etag version)]
                                           (assoc h "etag" etag)
                                           h)
@@ -917,7 +1127,7 @@
   * `request-counter` An atom containing an int, used to generate request IDs.
   * `cost-tracker` A [[s4.$$$$/ICostTracker]], for estimating costs.
   * `clock` A `java.time.Clock` to use for generating timestamps."
-  [{:keys [konserve hostname request-id-prefix request-counter cost-tracker clock] :as system}]
+  [{:keys [konserve hostname request-id-prefix request-counter cost-tracker clock sqs-server] :as system}]
   (fn [request respond error]
     (async/go
       (let [request-id (str request-id-prefix (format "%016x" (swap! request-counter inc)))]
@@ -1033,7 +1243,8 @@
                                     (respond {:status 501
                                               :headers xml-content-type
                                               :body [:Error [:Code "NotImplemented"] [:Resource (str \/ bucket \/ object)]]})
-                                    (let [[old new] (sv/<?
+                                    (let [last-mod (ZonedDateTime/now clock)
+                                          [old new] (sv/<?
                                                       sv/S
                                                       (kp/-update-in konserve [:version-meta bucket object]
                                                         (fn [versions]
@@ -1044,7 +1255,7 @@
                                                                 (let [version-id (generate-blob-id bucket object)]
                                                                   (cons {:version-id    version-id
                                                                          :deleted?      true
-                                                                         :last-modified (ZonedDateTime/now clock)}
+                                                                         :last-modified last-mod}
                                                                         versions))
 
                                                                 (:deleted? (first versions))
@@ -1057,11 +1268,29 @@
                                                                 :else
                                                                 (cons {:version-id    nil
                                                                        :deleted?      true
-                                                                       :last-modified (ZonedDateTime/now clock)}
+                                                                       :last-modified last-mod}
                                                                       (remove #(nil? (:version-id %)) versions))))))]
                                       (when-let [deleted-version (first (set/difference (set old) (set new)))]
                                         (when-let [blob-id (:blob-id deleted-version)]
                                           (sv/<? sv/S (kp/-dissoc konserve blob-id))))
+                                      (sv/<? sv/S (trigger-bucket-notification sqs-server (:notifications bucket-meta)
+                                                                               {:eventVersion "2.1"
+                                                                                :eventSource "aws:s3"
+                                                                                :awsRegion "s4"
+                                                                                :eventTime (.format last-mod DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                                                :eventName (if (some? versionId)
+                                                                                             "ObjectRemoved:DeleteMarkerCreated"
+                                                                                             "ObjectRemoved:Delete")
+                                                                                :userIdentity {:principalId "S4"}
+                                                                                :requestParameters {:sourceIPAddress (:remote-addr request)}
+                                                                                :responseElements {:x-amz-request-id request-id}
+                                                                                :s3 {:s3SchemaVersion "1.0"
+                                                                                     :bucket {:name bucket
+                                                                                              :ownerIdentity {:principalId "S4"}
+                                                                                              :arn bucket}
+                                                                                     :object (assoc-some {:key object
+                                                                                                          :sequencer "00"}
+                                                                                               :versionId versionId)}}))
                                       (cond (some? versionId)
                                             (respond {:status 204
                                                       :headers (as-> {"x-amz-version-id" versionId}
@@ -1113,14 +1342,6 @@
                              [:Resource {} (:uri request)]
                              [:RequestId {} request-id]]})))))))
 
-(defn aleph-async-ring-adapter
-  "Adapter function for using an async Ring handler with aleph."
-  [async-handler]
-  (fn [request]
-    (let [response (d/deferred)]
-      (async-handler request (partial d/success! response) (partial d/error! response))
-      response)))
-
 (defn make-handler
   "Make an asynchronous, authenticated S3 ring handler.
 
@@ -1161,6 +1382,15 @@
   * `request-id-prefix` A string to prepend to request IDs. Default nil.
   * `clock` A `java.time.Clock` to use for generating timestamps. Default
     is `(java.time.Clock/systemUTC)`
+  * `sqs-server` An optional atom containing the system in use for simulated
+    SQS queues; this must, at minimum, contain the key :queues, which is
+    an atom containing a map of queue name -> queue. E.g. this should match
+    what is returned by [[s4.sqs/make-server!]]. If not specified, SQS events
+    are never triggered and can't be configured.
+  * `enable-sqs?` If set to true, then SQS is assumed to be desired, and
+    if `sqs-server` is nil, this will create a new SQS server, sharing the
+    konserve, auth-store, bind-address, and reloadable? parameters, and
+    binding to a random port.
 
   Return value is an atom, containing a map of keys:
 
@@ -1172,32 +1402,38 @@
   * `auth-store` The auth store instance. If you let this create the
     default store, you likely want to assoc your fake access keys into
     the atom contained by the AtomAuthStore."
-  [{:keys [bind-address port konserve cost-tracker reloadable? auth-store hostname request-id-prefix clock]
-    :or   {bind-address "127.0.0.1"
-           port         0
-           hostname     "localhost"
-           clock        (Clock/systemUTC)}}]
+  [{:keys [bind-address port konserve cost-tracker reloadable? auth-store hostname request-id-prefix clock sqs-server enable-sqs?]
+    :or   {hostname     "localhost"
+           clock        (Clock/systemUTC)
+           bind-address "127.0.0.1"
+           port         0}}]
   (let [bind-addr (InetSocketAddress. bind-address port)
         konserve (or konserve (sv/<?? sv/S (km/new-mem-store)))
         cost-tracker (or cost-tracker ($/cost-tracker konserve))
         auth-store (or auth-store (auth/->AtomAuthStore (atom {})))
-        system {:konserve konserve
-                :cost-tracker cost-tracker
-                :hostname hostname
-                :request-counter (atom 0)
+        sqs-server (or sqs-server
+                       (when enable-sqs?
+                         (sqs/make-server! {:konserve konserve
+                                            :auth-store auth-store
+                                            :bind-address bind-address
+                                            :reloadable? reloadable?})))
+        system {:konserve          konserve
+                :cost-tracker      cost-tracker
+                :hostname          hostname
+                :request-counter   (atom 0)
                 :request-id-prefix request-id-prefix
-                :auth-store auth-store
-                :clock clock}
+                :auth-store        auth-store
+                :clock             clock
+                :sqs-server        sqs-server}
         system-atom (atom system)
         handler (if reloadable?
                   (make-reloadable-handler system-atom)
                   (make-handler system))
-        server (aleph.http/start-server (aleph-async-ring-adapter handler)
-                                        {:socket-address bind-addr})
-        server-port (aleph.netty/port server)]
+        server (http/start-server (util/aleph-async-ring-adapter handler)
+                                  {:socket-address bind-addr})]
     (swap! system-atom assoc
       :server server
-      :bind-address (InetSocketAddress. bind-address server-port))
+      :bind-address (InetSocketAddress. bind-address (aleph.netty/port server)))
     system-atom))
 
 (comment

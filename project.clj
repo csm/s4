@@ -17,6 +17,9 @@
                                    [com.cognitect.aws/api "0.8.352"]
                                    [com.cognitect.aws/endpoints "1.1.11.632"]
                                    [com.cognitect.aws/s3 "726.2.488.0"]
-                                   [com.cognitect/anomalies "0.1.12"]]
+                                   [com.cognitect.aws/sqs "747.2.533.0"]
+                                   [com.cognitect/anomalies "0.1.12"]
+                                   [ring/ring-jetty-adapter "1.7.1"]]
+                    :jvm-opts ["-Ds4.auth.debug=true"]
                     :resource-paths ["test-resources"]}}
   :repl-options {:init-ns s4.repl})
