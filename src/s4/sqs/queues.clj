@@ -95,14 +95,14 @@
           (do
             (.offer hidden-messages (->delayed message hide-duration))
             (if (< 1 max-messages)
-              (loop [messages [message]]
+              (loop [msgs [message]]
                 (if-let [message (.poll messages)]
                   (do
                     (.offer hidden-messages (->delayed message hide-duration))
                     (if (< (count messages) max-messages)
-                      (recur (conj messages message))
-                      messages))
-                  messages))
+                      (recur (conj msgs message))
+                      msgs))
+                  msgs))
               [message]))
           []))))
 
