@@ -818,10 +818,10 @@
       (doseq [config notification-config]
         (when (or (and (= "ObjectCreated:Put" (get notification :eventName))
                        (some #{"s3:ObjectCreated:Put" "s3:ObjectCreated:*"} (:Event config)))
-                  (and (= "ObjectDeleted:Delete" (get notification :eventName))
-                       (some #{"s3:ObjectDeleted:Delete" "s3:ObjectDeleted:*"} (:Event config)))
-                  (and (= "ObjectDeleted:DeleteMarkerCreated" (get notification :eventName))
-                       (some #{"s3:ObjectDeleted:DeleteMarkerCreated" "s3:ObjectDeleted:*"} (:Event config)))
+                  (and (= "ObjectRemoved:Delete" (get notification :eventName))
+                       (some #{"s3:ObjectRemoved:Delete" "s3:ObjectRemoved:*"} (:Event config)))
+                  (and (= "ObjectRemoved:DeleteMarkerCreated" (get notification :eventName))
+                       (some #{"s3:ObjectRemoved:DeleteMarkerCreated" "s3:ObjectRemoved:*"} (:Event config)))
                   (every? (fn [rule]
                             (let [name (second (first (filter #(= :Name (first %)) (rest rule))))
                                   value (second (first (filter #(= :Value (first %)) (rest rule))))]
@@ -1279,8 +1279,8 @@
                                                                                 :awsRegion "s4"
                                                                                 :eventTime (.format last-mod DateTimeFormatter/ISO_OFFSET_DATE_TIME)
                                                                                 :eventName (if (some? versionId)
-                                                                                             "ObjectDeleted:DeleteMarkerCreated"
-                                                                                             "ObjectDeleted:Delete")
+                                                                                             "ObjectRemoved:DeleteMarkerCreated"
+                                                                                             "ObjectRemoved:Delete")
                                                                                 :userIdentity {:principalId "S4"}
                                                                                 :requestParameters {:sourceIPAddress (:remote-addr request)}
                                                                                 :responseElements {:x-amz-request-id request-id}
