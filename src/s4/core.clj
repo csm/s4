@@ -1058,14 +1058,16 @@
                                 (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
                                   (let [content (async/promise-chan)]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
-                                    (sv/<? sv/S
-                                      (kp/-bget konserve (:blob-id version)
-                                        (fn [in] (async/thread
-                                                   (if-let [in (some-> (unwrap-input-stream in)
-                                                                       (ByteStreams/limit (second range))
-                                                                       (ByteStreams/skipFully (first range)))]
-                                                     (async/put! content in)
-                                                     (async/close! content))))))
+                                    (if (= 0 (:content-length version))
+                                      (sv/<? sv/S
+                                        (kp/-bget konserve (:blob-id version)
+                                          (fn [in] (async/thread
+                                                     (if-let [in (some-> (unwrap-input-stream in)
+                                                                         (ByteStreams/limit (second range))
+                                                                         (ByteStreams/skipFully (first range)))]
+                                                       (async/put! content in)
+                                                       (async/close! content))))))
+                                      (async/close! content))
                                     (assoc response :body (sv/<? sv/S content)))
                                   (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
@@ -1079,12 +1081,14 @@
                                 (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
                                   (let [content (async/promise-chan)]
                                     ($/-track-data-out! cost-tracker (:content-length version))
-                                    (sv/<? sv/S
-                                      (kp/-bget konserve (:blob-id version)
-                                        (fn [in] (async/go
-                                                   (if-let [in (unwrap-input-stream in)]
-                                                     (async/put! content in)
-                                                     (async/close! content))))))
+                                    (if (= 0 (:content-length version))
+                                      (sv/<? sv/S
+                                        (kp/-bget konserve (:blob-id version)
+                                          (fn [in] (async/go
+                                                     (if-let [in (unwrap-input-stream in)]
+                                                       (async/put! content in)
+                                                       (async/close! content))))))
+                                      (async/close! content))
                                     (assoc response :body (sv/<? sv/S content)))
                                   (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (:content-length version))
