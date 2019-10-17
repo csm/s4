@@ -1057,17 +1057,23 @@
                                                        "content-range" (str "bytes " (first range) \- (second range) \/ (:content-length version)))}]
                               (if with-body?
                                 (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
-                                  ; memory store seems to just return the cb result
-                                  ; others return a channel ¯\_(ツ)_/¯
+                                  ; there seems to be no consistency in what -bget returns
+                                  ; memory store returns the callback's value
+                                  ; filestore expects a channel from the callback, takes from
+                                  ; that channel, and returns that value on a new channel
+                                  ; leveldb returns what the callback returns, but *within*
+                                  ; a go block (so it's a channel in a channel).
                                   (let [content (kp/-bget konserve (:blob-id version)
                                                           (fn [in]
-                                                            (some-> (unwrap-input-stream in)
-                                                                    (ByteStreams/limit (second range))
-                                                                    (ByteStreams/skipFully (first range))
-                                                                    (ByteStreams/toByteArray))))
-                                        content (if (satisfies? impl/ReadPort content)
-                                                  (sv/<? sv/S content)
-                                                  content)]
+                                                            (async/thread
+                                                              (some-> (unwrap-input-stream in)
+                                                                      (ByteStreams/limit (second range))
+                                                                      (ByteStreams/skipFully (first range))
+                                                                      (ByteStreams/toByteArray)))))
+                                        content (loop [content content]
+                                                  (if (satisfies? impl/ReadPort content)
+                                                    (recur (sv/<? sv/S content))
+                                                    content))]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
                                     (assoc response :body content))
                                   (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
@@ -1082,11 +1088,13 @@
                                 (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
                                   (let [content (kp/-bget konserve (:blob-id version)
                                                           (fn [in]
-                                                            (some-> (unwrap-input-stream in)
-                                                                    (ByteStreams/toByteArray))))
-                                        content (if (satisfies? impl/ReadPort content)
-                                                  (sv/<? sv/S content)
-                                                  content)]
+                                                            (async/thread
+                                                              (some-> (unwrap-input-stream in)
+                                                                      (ByteStreams/toByteArray)))))
+                                        content (loop [content content]
+                                                  (if (satisfies? impl/ReadPort content)
+                                                    (recur (sv/<? sv/S content))
+                                                    content))]
                                     ($/-track-data-out! cost-tracker (:content-length version))
                                     (assoc response :body content))
                                   (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
