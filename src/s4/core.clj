@@ -1127,6 +1127,89 @@
                               [:RequestId request-id]])
               r)))))
 
+(defn ^:no-doc delete-object
+  [{:keys [konserve clock sqs-server]} request bucket object bucket-meta request-id]
+  (sv/go-try sv/S
+    ;(log/debug :task ::delete-object :phase :begin :bucket bucket :object object)
+    (let [{:keys [versionId tagging]} (keywordize-keys (uri/query->map (:query-string request)))]
+      (if (some? tagging)
+        {:status 501
+         :headers xml-content-type
+         :body [:Error [:Code "NotImplemented"] [:Resource (str \/ bucket \/ object)]]}
+        (let [last-mod (ZonedDateTime/now clock)
+              [old new] (sv/<?
+                          sv/S
+                          (kp/-update-in konserve [:version-meta bucket object]
+                                         (fn [versions]
+                                           ;(log/debug :task ::delete-object :phase :updating-version :versions versions)
+                                           (if (nil? versions)
+                                             versions
+                                             (cond (some? versionId)
+                                                   (remove #(= versionId (:version-id %)) versions)
+
+                                                   (= "Enabled" (:versioning bucket-meta))
+                                                   (let [version-id (generate-blob-id bucket object)]
+                                                     (cons {:version-id    version-id
+                                                            :deleted?      true
+                                                            :last-modified last-mod}
+                                                           versions))
+
+                                                   (:deleted? (first versions))
+                                                   versions
+
+                                                   (and (<= (count versions) 1)
+                                                        (not= "Enabled" (:versioning bucket-meta)))
+                                                   nil
+
+                                                   :else
+                                                   (cons {:version-id    nil
+                                                          :deleted?      true
+                                                          :last-modified last-mod}
+                                                         (remove #(nil? (:version-id %)) versions)))))))]
+          ;(log/debug :task ::delete-object :phase :updated-versions :result [old new])
+          (if (and (nil? old) (nil? new))
+            {:status 204}
+            (do
+              (when-let [deleted-version (first (set/difference (set old) (set new)))]
+                (when-let [blob-id (:blob-id deleted-version)]
+                  (sv/<? sv/S (kp/-dissoc konserve blob-id))))
+              (sv/<? sv/S (trigger-bucket-notification sqs-server (:notifications bucket-meta)
+                                                       {:eventVersion "2.1"
+                                                        :eventSource "aws:s3"
+                                                        :awsRegion "s4"
+                                                        :eventTime (.format last-mod DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                        :eventName (if (some? versionId)
+                                                                     "ObjectRemoved:DeleteMarkerCreated"
+                                                                     "ObjectRemoved:Delete")
+                                                        :userIdentity {:principalId "S4"}
+                                                        :requestParameters {:sourceIPAddress (:remote-addr request)}
+                                                        :responseElements {:x-amz-request-id request-id}
+                                                        :s3 {:s3SchemaVersion "1.0"
+                                                             :bucket {:name bucket
+                                                                      :ownerIdentity {:principalId "S4"}
+                                                                      :arn bucket}
+                                                             :object (assoc-some {:key object
+                                                                                  :sequencer "00"}
+                                                                                 :versionId versionId)}}))
+              (cond (some? versionId)
+                    {:status 204
+                     :headers (as-> {"x-amz-version-id" versionId}
+                                    h
+                                    (if (some #(= versionId (:version-id %)) old)
+                                      (assoc h "x-amz-delete-marker" "true")
+                                      h))}
+
+                    (not-empty new)
+                    {:status 204
+                     :headers {"x-amz-version-id" (or (:version-id (first new)) "null")
+                               "x-amz-delete-marker" "true"}}
+
+                    :else
+                    {:status 204
+                     :headers (if (or (empty? old) (nil? (:versioning bucket-meta)))
+                                {}
+                                {"x-amz-version-id" "null"})}))))))))
+
 (defn s3-handler
   "Create an asynchronous Ring handler for the S3 API.
 
@@ -1217,12 +1300,64 @@
 
               :post (let [params (keywordize-keys (uri/query->map (:query-string request)))]
                       ($/-track-put-request! cost-tracker)
-                      (respond {:status 501
-                                :headers xml-content-type
-                                :body [:Error {}
-                                       [:Code {} "NotImplemented"]
-                                       [:Resource {} (:uri request)]
-                                       [:RequestId {} request-id]]}))
+                      (cond
+                        (and (some? (:delete params))
+                             (nil? object))
+                        (if-let [bucket-meta (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
+                          (let [objects (element-as-sexp (xml/parse (:body request) :namespace-aware false))]
+                            (if (not= :Delete (first objects))
+                              (respond {:status 400
+                                        :headers xml-content-type
+                                        :body [:Error
+                                               [:Code "MalformedXML"]
+                                               [:Resource (:uri request)]
+                                               [:RequestId request-id]]})
+                              (let [quiet (= "true" (->> (rest objects)
+                                                         (filter #(= :Quiet (first %)))
+                                                         (first)
+                                                         (second)))
+                                    results (->> (rest objects)
+                                                 (filter #(= :Object (first %)))
+                                                 (map #(let [object (into {} (rest %))
+                                                             query {}
+                                                             query (if-let [v (:VersionId object)]
+                                                                     (assoc query :versionId v))
+                                                             request {:query-string (uri/map->query query)}]
+                                                         (async/go
+                                                           [object (async/<! (delete-object system request bucket (:Key object) bucket-meta request-id))])))
+                                                 (sv/<?* sv/S)
+                                                 (doall))]
+                                (respond {:status 200
+                                          :headers xml-content-type
+                                          :body (into [:DeleteObjectOutput]
+                                                      (->> results
+                                                           (remove #(and quiet (= 200 (:status (second %)))))
+                                                           (map (fn [[object result]]
+                                                                  (if (= 200 (:status result))
+                                                                    (vec (concat [:Deleted
+                                                                                  [:Key (:Key object)]]
+                                                                                 (some->> (:VersionId object) (vector :VersionId) (vector))
+                                                                                 (when-let [v (get-in result [:headers "x-amz-version-id"])]
+                                                                                   [[:DeleteMarkerVersionId v]])
+                                                                                 (when (= "true" (get-in result [:headers "x-amz-delete-marker"]))
+                                                                                   [[:DeleteMarker "true"]])))
+                                                                    (vec (concat [:Error
+                                                                                  [:Key (:Key object)]]
+                                                                                 (some->> (:VersionId object) (vector :VersionId) (vector))
+                                                                                 (->> (:body result)
+                                                                                      (rest)
+                                                                                      (filter #(= :Code (first %)))))))))))}))))
+                          (respond {:status 404
+                                    :headers xml-content-type
+                                    :body [:Error [:Code "NoSuchBucket"] [:Resource (:uri request)] [:RequestId request-id]]}))
+
+                        :else
+                        (respond {:status 501
+                                  :headers xml-content-type
+                                  :body [:Error {}
+                                         [:Code {} "NotImplemented"]
+                                         [:Resource {} (:uri request)]
+                                         [:RequestId {} request-id]]})))
 
               :delete (do
                         ($/-track-get-request! cost-tracker)
@@ -1248,79 +1383,7 @@
 
                               (and (not-empty bucket) (not-empty object))
                               (if-let [bucket-meta (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
-                                (let [{:keys [versionId tagging]}
-                                      (keywordize-keys (uri/query->map (:query-string request)))]
-                                  (if (some? tagging)
-                                    (respond {:status 501
-                                              :headers xml-content-type
-                                              :body [:Error [:Code "NotImplemented"] [:Resource (str \/ bucket \/ object)]]})
-                                    (let [last-mod (ZonedDateTime/now clock)
-                                          [old new] (sv/<?
-                                                      sv/S
-                                                      (kp/-update-in konserve [:version-meta bucket object]
-                                                        (fn [versions]
-                                                          (cond (some? versionId)
-                                                                (remove #(= versionId (:version-id %)) versions)
-
-                                                                (= "Enabled" (:versioning bucket-meta))
-                                                                (let [version-id (generate-blob-id bucket object)]
-                                                                  (cons {:version-id    version-id
-                                                                         :deleted?      true
-                                                                         :last-modified last-mod}
-                                                                        versions))
-
-                                                                (:deleted? (first versions))
-                                                                versions
-
-                                                                (and (<= (count versions) 1)
-                                                                     (not= "Enabled" (:versioning bucket-meta)))
-                                                                nil
-
-                                                                :else
-                                                                (cons {:version-id    nil
-                                                                       :deleted?      true
-                                                                       :last-modified last-mod}
-                                                                      (remove #(nil? (:version-id %)) versions))))))]
-                                      (when-let [deleted-version (first (set/difference (set old) (set new)))]
-                                        (when-let [blob-id (:blob-id deleted-version)]
-                                          (sv/<? sv/S (kp/-dissoc konserve blob-id))))
-                                      (sv/<? sv/S (trigger-bucket-notification sqs-server (:notifications bucket-meta)
-                                                                               {:eventVersion "2.1"
-                                                                                :eventSource "aws:s3"
-                                                                                :awsRegion "s4"
-                                                                                :eventTime (.format last-mod DateTimeFormatter/ISO_OFFSET_DATE_TIME)
-                                                                                :eventName (if (some? versionId)
-                                                                                             "ObjectRemoved:DeleteMarkerCreated"
-                                                                                             "ObjectRemoved:Delete")
-                                                                                :userIdentity {:principalId "S4"}
-                                                                                :requestParameters {:sourceIPAddress (:remote-addr request)}
-                                                                                :responseElements {:x-amz-request-id request-id}
-                                                                                :s3 {:s3SchemaVersion "1.0"
-                                                                                     :bucket {:name bucket
-                                                                                              :ownerIdentity {:principalId "S4"}
-                                                                                              :arn bucket}
-                                                                                     :object (assoc-some {:key object
-                                                                                                          :sequencer "00"}
-                                                                                               :versionId versionId)}}))
-                                      (cond (some? versionId)
-                                            (respond {:status 204
-                                                      :headers (as-> {"x-amz-version-id" versionId}
-                                                                     h
-                                                                     (if (some #(= versionId (:version-id %)) old)
-                                                                       (assoc h "x-amz-delete-marker" "true")
-                                                                       h))})
-
-                                            (not-empty new)
-                                            (respond {:status 204
-                                                      :headers {"x-amz-version-id" (or (:version-id (first new)) "null")
-                                                                "x-amz-delete-marker" "true"}})
-
-                                            :else
-                                            (respond {:status 204
-                                                      :headers (if (or (empty? old) (nil? (:versioning bucket-meta)))
-                                                                 {}
-                                                                 {"x-amz-version-id" "null"})})))))
-
+                                (respond (sv/<? sv/S (delete-object system request bucket object bucket-meta request-id)))
                                 (respond {:status 404}
                                          :headers xml-content-type
                                          :body [:Error {}
