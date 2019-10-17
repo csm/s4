@@ -1336,7 +1336,9 @@
                                                                     (vec (concat [:Error
                                                                                   [:Key (:Key object)]]
                                                                                  (some->> (:VersionId object) (vector :VersionId) (vector))
-                                                                                 (rest (:body result)))))))))}))))
+                                                                                 (->> (:body result)
+                                                                                      (rest)
+                                                                                      (filter #(= :Code (first %)))))))))))}))))
                           (respond {:status 404
                                     :headers xml-content-type
                                     :body [:Error [:Code "NoSuchBucket"] [:Resource (:uri request)] [:RequestId request-id]]}))
