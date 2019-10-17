@@ -188,3 +188,26 @@
 
       (is (= {} (aws/invoke client {:op :DeleteBucket
                                     :request {:Bucket "test"}}))))))
+
+(deftest test-delete-objects
+  (let [client (aws/client {:api :s3
+                            :credentials-provider (creds/basic-credentials-provider {:access-key-id access-key
+                                                                                     :secret-access-key secret-key})
+                            :endpoint-override {:protocol "http"
+                                                :hostname "localhost"
+                                                :port *port*}
+                            :region "us-west-2"})]
+    (testing "that we can delete multiple objects"
+      (is (= {:Location "/test"}
+             (aws/invoke client {:op :CreateBucket
+                                 :request {:Bucket "test"}})))
+      (dotimes [i 10]
+        (is (= {:ETag "d41d8cd98f00b204e9800998ecf8427e"}
+               (aws/invoke client {:op :PutObject
+                                   :request {:Bucket "test"
+                                             :Key (str "object-" i ".txt")}}))))
+      (let [response (aws/invoke client {:op :DeleteObjects
+                                         :request {:Bucket "test"
+                                                   :Delete {:Objects (map #(hash-map :Key (str "object-" % ".txt"))
+                                                                          (range 10))}}})]
+        (is (nil? (::anomalies/category response)))))))
