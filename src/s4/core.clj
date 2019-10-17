@@ -17,7 +17,8 @@
             [aleph.http :as http]
             [s4.util :as util :refer [xml-content-type s3-xmlns]]
             [clojure.spec.alpha :as s]
-            [clojure.data.json :as json])
+            [clojure.data.json :as json]
+            [clojure.core.async.impl.protocols :as impl])
   (:import [java.time ZonedDateTime ZoneId Instant Clock]
            [java.time.format DateTimeFormatter DateTimeParseException]
            [java.nio ByteBuffer]
@@ -1056,17 +1057,25 @@
                                                        "content-range" (str "bytes " (first range) \- (second range) \/ (:content-length version)))}]
                               (if with-body?
                                 (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
-                                  (let [content (async/promise-chan)]
+                                  ; there seems to be no consistency in what -bget returns
+                                  ; memory store returns the callback's value
+                                  ; filestore expects a channel from the callback, takes from
+                                  ; that channel, and returns that value on a new channel
+                                  ; leveldb returns what the callback returns, but *within*
+                                  ; a go block (so it's a channel in a channel).
+                                  (let [content (kp/-bget konserve (:blob-id version)
+                                                          (fn [in]
+                                                            (async/thread
+                                                              (some-> (unwrap-input-stream in)
+                                                                      (ByteStreams/limit (second range))
+                                                                      (ByteStreams/skipFully (first range))
+                                                                      (ByteStreams/toByteArray)))))
+                                        content (loop [content content]
+                                                  (if (satisfies? impl/ReadPort content)
+                                                    (recur (sv/<? sv/S content))
+                                                    content))]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
-                                    (sv/<? sv/S
-                                      (kp/-bget konserve (:blob-id version)
-                                        (fn [in] (async/thread
-                                                   (if-let [in (some-> (unwrap-input-stream in)
-                                                                       (ByteStreams/limit (second range))
-                                                                       (ByteStreams/skipFully (first range)))]
-                                                     (async/put! content in)
-                                                     (async/close! content))))))
-                                    (assoc response :body (sv/<? sv/S content)))
+                                    (assoc response :body content))
                                   (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
                                     (assoc response :body (ByteArrayInputStream. content (first range) (- (second range) (first range))))))
@@ -1077,15 +1086,17 @@
                                             :headers headers}]
                               (if with-body?
                                 (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
-                                  (let [content (async/promise-chan)]
+                                  (let [content (kp/-bget konserve (:blob-id version)
+                                                          (fn [in]
+                                                            (async/thread
+                                                              (some-> (unwrap-input-stream in)
+                                                                      (ByteStreams/toByteArray)))))
+                                        content (loop [content content]
+                                                  (if (satisfies? impl/ReadPort content)
+                                                    (recur (sv/<? sv/S content))
+                                                    content))]
                                     ($/-track-data-out! cost-tracker (:content-length version))
-                                    (sv/<? sv/S
-                                      (kp/-bget konserve (:blob-id version)
-                                        (fn [in] (async/go
-                                                   (if-let [in (unwrap-input-stream in)]
-                                                     (async/put! content in)
-                                                     (async/close! content))))))
-                                    (assoc response :body (sv/<? sv/S content)))
+                                    (assoc response :body content))
                                   (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (:content-length version))
                                     (assoc response :body (ByteArrayInputStream. content))))
