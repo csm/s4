@@ -1130,7 +1130,7 @@
 (defn ^:no-doc delete-object
   [{:keys [konserve clock sqs-server]} request bucket object bucket-meta request-id]
   (sv/go-try sv/S
-    (log/debug :task ::delete-object :phase :begin :bucket bucket :object object)
+    ;(log/debug :task ::delete-object :phase :begin :bucket bucket :object object)
     (let [{:keys [versionId tagging]} (keywordize-keys (uri/query->map (:query-string request)))]
       (if (some? tagging)
         {:status 501
@@ -1141,7 +1141,7 @@
                           sv/S
                           (kp/-update-in konserve [:version-meta bucket object]
                                          (fn [versions]
-                                           (log/debug :task ::delete-object :phase :updating-version :versions versions)
+                                           ;(log/debug :task ::delete-object :phase :updating-version :versions versions)
                                            (if (nil? versions)
                                              versions
                                              (cond (some? versionId)
@@ -1166,7 +1166,7 @@
                                                           :deleted?      true
                                                           :last-modified last-mod}
                                                          (remove #(nil? (:version-id %)) versions)))))))]
-          (log/debug :task ::delete-object :phase :updated-versions :result [old new])
+          ;(log/debug :task ::delete-object :phase :updated-versions :result [old new])
           (if (and (nil? old) (nil? new))
             {:status 204}
             (do
