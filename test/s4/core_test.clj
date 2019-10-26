@@ -185,6 +185,13 @@
                                  :request {:Bucket "test"
                                            :Key "encode$file.text"}})))
       (is (empty? (async/<!! (kp/-get-in (:konserve @*s4*) [:blobs "test"]))))
+      (is (= {:Prefix ""
+              :Delimiter ""
+              :MaxKeys 1000
+              :IsTruncated false
+              :Name "test"
+              :KeyCount 0}
+             (aws/invoke client {:op :ListObjectsV2 :request {:Bucket "test"}})))
 
       (is (= {} (aws/invoke client {:op :DeleteBucket
                                     :request {:Bucket "test"}}))))))

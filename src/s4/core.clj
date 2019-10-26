@@ -1139,33 +1139,38 @@
         (let [last-mod (ZonedDateTime/now clock)
               [old new] (sv/<?
                           sv/S
-                          (kp/-update-in konserve [:version-meta bucket object]
-                                         (fn [versions]
-                                           ;(log/debug :task ::delete-object :phase :updating-version :versions versions)
-                                           (if (nil? versions)
-                                             versions
-                                             (cond (some? versionId)
-                                                   (remove #(= versionId (:version-id %)) versions)
+                          (kp/-update-in konserve [:version-meta bucket]
+                                         (fn [objects]
+                                           (let [res (update objects object
+                                                       (fn [versions]
+                                                         ;(log/debug :task ::delete-object :phase :updating-version :versions versions)
+                                                         (if (nil? versions)
+                                                           versions
+                                                           (cond (some? versionId)
+                                                                 (remove #(= versionId (:version-id %)) versions)
 
-                                                   (= "Enabled" (:versioning bucket-meta))
-                                                   (let [version-id (generate-blob-id bucket object)]
-                                                     (cons {:version-id    version-id
-                                                            :deleted?      true
-                                                            :last-modified last-mod}
-                                                           versions))
+                                                                 (= "Enabled" (:versioning bucket-meta))
+                                                                 (let [version-id (generate-blob-id bucket object)]
+                                                                   (cons {:version-id    version-id
+                                                                          :deleted?      true
+                                                                          :last-modified last-mod}
+                                                                         versions))
 
-                                                   (:deleted? (first versions))
-                                                   versions
+                                                                 (:deleted? (first versions))
+                                                                 versions
 
-                                                   (and (<= (count versions) 1)
-                                                        (not= "Enabled" (:versioning bucket-meta)))
-                                                   nil
+                                                                 (and (<= (count versions) 1)
+                                                                      (not= "Enabled" (:versioning bucket-meta)))
+                                                                 nil
 
-                                                   :else
-                                                   (cons {:version-id    nil
-                                                          :deleted?      true
-                                                          :last-modified last-mod}
-                                                         (remove #(nil? (:version-id %)) versions)))))))]
+                                                                 :else
+                                                                 (cons {:version-id    nil
+                                                                        :deleted?      true
+                                                                        :last-modified last-mod}
+                                                                       (remove #(nil? (:version-id %)) versions))))))]
+                                             (if (nil? (get res object))
+                                               (dissoc res object)
+                                               res)))))]
           ;(log/debug :task ::delete-object :phase :updated-versions :result [old new])
           (if (and (nil? old) (nil? new))
             {:status 204}
@@ -1199,7 +1204,7 @@
                                       (assoc h "x-amz-delete-marker" "true")
                                       h))}
 
-                    (not-empty new)
+                    (not-empty (get new object))
                     {:status 204
                      :headers {"x-amz-version-id" (or (:version-id (first new)) "null")
                                "x-amz-delete-marker" "true"}}
