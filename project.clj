@@ -1,4 +1,4 @@
-(defproject s4 "0.1.9-SNAPSHOT"
+(defproject s4 "0.1.10-SNAPSHOT"
   :description "Simulated S3"
   :url "https://github.com/csm/s4"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
