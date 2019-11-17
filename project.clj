@@ -5,7 +5,7 @@
             :url "https://www.eclipse.org/legal/epl-2.0/"}
   :dependencies [[org.clojure/clojure "1.10.1"]
                  [aleph "0.4.6"]
-                 [io.replikativ/konserve "0.5.1"]
+                 [io.replikativ/konserve "0.6.0-SNAPSHOT"]
                  [io.replikativ/superv.async "0.2.9"]
                  [com.arohner/uri "0.1.2"]
                  [org.clojure/data.xml "0.2.0-alpha6"]]

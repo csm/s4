@@ -6,6 +6,7 @@
             [clojure.string :as string]
             [clojure.tools.logging :as log]
             [clojure.walk :refer [keywordize-keys]]
+            [konserve.core :as k]
             [konserve.memory :as km]
             [konserve.protocols :as kp]
             [konserve.serializers :as ser]
@@ -206,7 +207,7 @@
   (sv/go-try sv/S
     (let [params (keywordize-keys (uri/query->map (:query-string request)))]
       (if (empty? params)
-        (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+        (if-let [existing-bucket (not-empty (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket])))]
           {:status 409
            :headers xml-content-type
            :body [:Error
@@ -214,12 +215,12 @@
                   [:Resource (str \/ bucket)]
                   [:RequestId request-id]]}
           (do
-            (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket] {:created (ZonedDateTime/now clock)
-                                                                      :object-count 0}))
-            (sv/<? sv/S (kp/-assoc-in konserve [:version-meta bucket] (sorted-map)))
+            (sv/<? sv/S (k/assoc-in konserve [:bucket-meta bucket] {:created (ZonedDateTime/now clock)
+                                                                    :object-count 0}))
+            (sv/<? sv/S (k/assoc-in konserve [:version-meta bucket] (sorted-map)))
             {:status 200
              :headers {"location" (str \/ bucket)}}))
-        (if-let [existing-bucket (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
+        (if-let [existing-bucket (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket]))]
           (cond (some? (:versioning params))
                 (if-let [config (some-> (:body request) (xml/parse :namespace-aware false))]
                   (if (= "VersioningConfiguration" (name (:tag config)))
@@ -231,7 +232,7 @@
                                                                           (first)))]
                       (let [current-state (:versioning existing-bucket)]
                         (when (not= current-state new-state)
-                          (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket :versioning] new-state)))
+                          (sv/<? sv/S (k/assoc-in konserve [:bucket-meta bucket :versioning] new-state)))
                         {:status 200})
                       {:status 400
                        :headers xml-content-type
@@ -264,7 +265,7 @@
                                     (map (fn [tags] (filter #(#{:Key :Value} (:tag %)) tags)))
                                     (map (fn [tags] [(->> tags (filter #(= :Key (:tag %))) first :content first)
                                                      (->> tags (filter #(= :Value (:tag %))) first :content first)])))]
-                      (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket :tags] tags))
+                      (sv/<? sv/S (k/assoc-in konserve [:bucket-meta bucket :tags] tags))
                       {:status 204}))
                   {:status 400
                    :headers xml-content-type
@@ -283,10 +284,10 @@
                           (not-empty (:QueueConfiguration config))
                           (if-let [queue-metas (when (some? sqs-server)
                                                  (->> (:QueueConfiguration config)
-                                                      (map #(kp/-get-in (-> sqs-server deref :konserve) [:queue-meta (:QueueArn %)]))
+                                                      (map #(k/get-in (-> sqs-server deref :konserve) [:queue-meta (:QueueArn %)]))
                                                       (sv/<?* sv/S)))]
                             (do
-                              (sv/<? sv/S (kp/-assoc-in konserve [:bucket-meta bucket :notifications] (:QueueConfiguration config)))
+                              (sv/<? sv/S (k/assoc-in konserve [:bucket-meta bucket :notifications] (:QueueConfiguration config)))
                               {:status 200})
                             (throw (IllegalArgumentException.))))
 
@@ -321,7 +322,7 @@
           encode-key (fn [k] (if (= "url" encoding-type) (uri/uri-encode k) k))
           objects (remove nil? (map (fn [[k v]] (when-not (:deleted? (first v))
                                                   (assoc (first v) :key k)))
-                                    (sv/<? sv/S (kp/-get-in konserve [:version-meta bucket]))))
+                                    (sv/<? sv/S (k/get-in konserve [:version-meta bucket]))))
           objects (drop-while (fn [{:keys [key]}]
                                 (neg? (compare key (or continuation-token start-after))))
                               objects)
@@ -382,7 +383,7 @@
                                (uri/uri-encode k)
                                k))
           max-keys (Integer/parseInt max-keys)
-          versions (sv/<? sv/S (kp/-get-in konserve [:version-meta bucket]))
+          versions (sv/<? sv/S (k/get-in konserve [:version-meta bucket]))
           versions (mapcat (fn [[key versions]]
                              (let [[current & others] versions]
                                (cons (assoc current :key key :current? true)
@@ -489,7 +490,7 @@
   (sv/go-try sv/S
     (let [params (keywordize-keys (uri/query->map (:query-string request)))]
       (log/debug :task ::s3-handler :phase :get-bucket-request :bucket bucket :params params)
-      (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+      (if-let [existing-bucket (not-empty (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket])))]
         (cond
           (= "2" (:list-type params))
           (do
@@ -728,7 +729,7 @@
                    :or {max-uploads "1000" key-marker "" upload-id-marker ""}}
                   params
                   max-uploads (Integer/parseInt max-uploads)
-                  uploads (sv/<? sv/S (kp/-get-in konserve [:uploads bucket]))
+                  uploads (sv/<? sv/S (k/get-in konserve [:uploads bucket]))
                   uploads (doall (drop-while (fn [[[key upload-id]]]
                                                (and (not (pos? (compare key key-marker)))
                                                     (not (pos? (compare upload-id upload-id-marker)))))
@@ -830,7 +831,7 @@
                                 (string/starts-with? (get-in notification [:s3 :key]) value)
                                 (string/ends-with? (get-in notification [:s3 :key]) value))))
                           (rest (:Filter config))))
-          (when-let [queue-meta (sv/<? sv/S (kp/-get-in (-> sqs-server deref :konserve) [:queue-meta (:Queue config)]))]
+          (when-let [queue-meta (sv/<? sv/S (k/get-in (-> sqs-server deref :konserve) [:queue-meta (:Queue config)]))]
             (let [queues (queues/get-queue (-> sqs-server deref :queues) (:Queue config))
                   message-id (str (UUID/randomUUID))
                   body (json/write-str {:Records [(if-let [id (:Id config)]
@@ -844,7 +845,7 @@
 (defn ^:no-doc put-object
   [bucket object request {:keys [konserve cost-tracker clock sqs-server]} request-id]
   (sv/go-try sv/S
-    (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+    (if-let [existing-bucket (not-empty (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket])))]
       (let [blob-id (generate-blob-id bucket object)
             version-id (when (= "Enabled" (:versioning existing-bucket))
                          blob-id)
@@ -859,20 +860,20 @@
         (when (some? content)
           ($/-track-data-in! cost-tracker (count content))
           (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
-            (sv/<? sv/S (kp/-bassoc konserve blob-id content))
-            (sv/<? sv/S (kp/-assoc-in konserve blob-id content))))
-        (sv/<? sv/S (kp/-update-in konserve [:version-meta bucket object]
-                                   (fn [versions]
-                                     (cons
-                                       {:blob-id        blob-id
-                                        :version-id     version-id
-                                        :created        (ZonedDateTime/now clock)
-                                        :etag           (str \" etag \")
-                                        :content-type   content-type
-                                        :content-length (count content)}
-                                       (if (= "Enabled" (:versioning existing-bucket))
-                                         versions
-                                         (vec (filter #(= version-id (:version-id %)) versions)))))))
+            (sv/<? sv/S (k/bassoc konserve blob-id content))
+            (sv/<? sv/S (k/assoc-in konserve blob-id content))))
+        (sv/<? sv/S (k/update-in konserve [:version-meta bucket object]
+                      (fn [versions]
+                        (cons
+                          {:blob-id        blob-id
+                           :version-id     version-id
+                           :created        (ZonedDateTime/now clock)
+                           :etag           (str \" etag \")
+                           :content-type   content-type
+                           :content-length (count content)}
+                          (if (= "Enabled" (:versioning existing-bucket))
+                            versions
+                            (vec (filter #(= version-id (:version-id %)) versions)))))))
         (sv/<? sv/S (trigger-bucket-notification sqs-server (:notifications existing-bucket)
                                                  {:eventVersion "2.1"
                                                   :eventSource "aws:s3"
@@ -931,8 +932,8 @@
   [bucket object request {:keys [konserve cost-tracker]} request-id with-body?]
   (sv/go-try sv/S
     ($/-track-get-request! cost-tracker)
-    (if-let [existing-bucket (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
-      (if-let [versions (sv/<? sv/S (kp/-get-in konserve [:version-meta bucket object]))]
+    (if-let [existing-bucket (not-empty (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket])))]
+      (if-let [versions (sv/<? sv/S (k/get-in konserve [:version-meta bucket object]))]
         (let [params (keywordize-keys (uri/query->map (:query-string request)))]
           (cond (some? (:acl params))
                 (as-> {:status 200
@@ -1063,20 +1064,20 @@
                                   ; that channel, and returns that value on a new channel
                                   ; leveldb returns what the callback returns, but *within*
                                   ; a go block (so it's a channel in a channel).
-                                  (let [content (kp/-bget konserve (:blob-id version)
-                                                          (fn [in]
-                                                            (async/thread
-                                                              (some-> (unwrap-input-stream in)
-                                                                      (ByteStreams/limit (second range))
-                                                                      (ByteStreams/skipFully (first range))
-                                                                      (ByteStreams/toByteArray)))))
+                                  (let [content (k/bget konserve (:blob-id version)
+                                                                 (fn [in]
+                                                                   (async/thread
+                                                                     (some-> (unwrap-input-stream in)
+                                                                             (ByteStreams/limit (second range))
+                                                                             (ByteStreams/skipFully (first range))
+                                                                             (ByteStreams/toByteArray)))))
                                         content (loop [content content]
                                                   (if (satisfies? impl/ReadPort content)
                                                     (recur (sv/<? sv/S content))
                                                     content))]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
                                     (assoc response :body content))
-                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
+                                  (let [content (or (sv/<? sv/S (k/get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (- (second range) (first range)))
                                     (assoc response :body (ByteArrayInputStream. content (first range) (- (second range) (first range))))))
                                 response))
@@ -1086,18 +1087,18 @@
                                             :headers headers}]
                               (if with-body?
                                 (if (satisfies? kp/PBinaryAsyncKeyValueStore konserve)
-                                  (let [content (kp/-bget konserve (:blob-id version)
-                                                          (fn [in]
-                                                            (async/thread
-                                                              (some-> (unwrap-input-stream in)
-                                                                      (ByteStreams/toByteArray)))))
+                                  (let [content (k/bget konserve (:blob-id version)
+                                                                 (fn [in]
+                                                                   (async/thread
+                                                                     (some-> (unwrap-input-stream in)
+                                                                             (ByteStreams/toByteArray)))))
                                         content (loop [content content]
                                                   (if (satisfies? impl/ReadPort content)
                                                     (recur (sv/<? sv/S content))
                                                     content))]
                                     ($/-track-data-out! cost-tracker (:content-length version))
                                     (assoc response :body content))
-                                  (let [content (or (sv/<? sv/S (kp/-get-in konserve (:blob-id version))) (byte-array 0))]
+                                  (let [content (or (sv/<? sv/S (k/get-in konserve (:blob-id version))) (byte-array 0))]
                                     ($/-track-data-out! cost-tracker (:content-length version))
                                     (assoc response :body (ByteArrayInputStream. content))))
                                 response)))))
@@ -1139,45 +1140,45 @@
         (let [last-mod (ZonedDateTime/now clock)
               [old new] (sv/<?
                           sv/S
-                          (kp/-update-in konserve [:version-meta bucket]
-                                         (fn [objects]
-                                           (let [res (update objects object
-                                                       (fn [versions]
-                                                         ;(log/debug :task ::delete-object :phase :updating-version :versions versions)
-                                                         (if (nil? versions)
-                                                           versions
-                                                           (cond (some? versionId)
-                                                                 (remove #(= versionId (:version-id %)) versions)
+                          (k/update-in konserve [:version-meta bucket]
+                            (fn [objects]
+                              (let [res (update objects object
+                                          (fn [versions]
+                                            ;(log/debug :task ::delete-object :phase :updating-version :versions versions)
+                                            (if (nil? versions)
+                                              versions
+                                              (cond (some? versionId)
+                                                    (remove #(= versionId (:version-id %)) versions)
 
-                                                                 (= "Enabled" (:versioning bucket-meta))
-                                                                 (let [version-id (generate-blob-id bucket object)]
-                                                                   (cons {:version-id    version-id
-                                                                          :deleted?      true
-                                                                          :last-modified last-mod}
-                                                                         versions))
+                                                    (= "Enabled" (:versioning bucket-meta))
+                                                    (let [version-id (generate-blob-id bucket object)]
+                                                      (cons {:version-id    version-id
+                                                             :deleted?      true
+                                                             :last-modified last-mod}
+                                                            versions))
 
-                                                                 (:deleted? (first versions))
-                                                                 versions
+                                                    (:deleted? (first versions))
+                                                    versions
 
-                                                                 (and (<= (count versions) 1)
-                                                                      (not= "Enabled" (:versioning bucket-meta)))
-                                                                 nil
+                                                    (and (<= (count versions) 1)
+                                                         (not= "Enabled" (:versioning bucket-meta)))
+                                                    nil
 
-                                                                 :else
-                                                                 (cons {:version-id    nil
-                                                                        :deleted?      true
-                                                                        :last-modified last-mod}
-                                                                       (remove #(nil? (:version-id %)) versions))))))]
-                                             (if (nil? (get res object))
-                                               (dissoc res object)
-                                               res)))))]
+                                                    :else
+                                                    (cons {:version-id    nil
+                                                           :deleted?      true
+                                                           :last-modified last-mod}
+                                                          (remove #(nil? (:version-id %)) versions))))))]
+                                (if (nil? (get res object))
+                                  (dissoc res object)
+                                  res)))))]
           ;(log/debug :task ::delete-object :phase :updated-versions :result [old new])
           (if (and (nil? old) (nil? new))
             {:status 204}
             (do
               (when-let [deleted-version (first (set/difference (set old) (set new)))]
                 (when-let [blob-id (:blob-id deleted-version)]
-                  (sv/<? sv/S (kp/-dissoc konserve blob-id))))
+                  (sv/<? sv/S (k/dissoc konserve blob-id))))
               (sv/<? sv/S (trigger-bucket-notification sqs-server (:notifications bucket-meta)
                                                        {:eventVersion "2.1"
                                                         :eventSource "aws:s3"
@@ -1250,7 +1251,7 @@
                                (empty? object))
                           (do
                             ($/-track-get-request! cost-tracker)
-                            (if (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))
+                            (if (not-empty (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket])))
                               (respond {:status 200})
                               (respond {:status 404})))
 
@@ -1266,7 +1267,7 @@
                             (respond {:status 200})))
 
               :get (cond (empty? bucket)
-                         (let [buckets (sv/<? sv/S (kp/-get-in konserve [:bucket-meta]))
+                         (let [buckets (sv/<? sv/S (k/get-in konserve [:bucket-meta]))
                                buckets-response [:ListAllMyBucketsResult {:xmlns "http://s3.amazonaws.com/doc/2006-03-01"}
                                                  [:Owner {}
                                                    [:ID {} "S4"]
@@ -1308,7 +1309,7 @@
                       (cond
                         (and (some? (:delete params))
                              (nil? object))
-                        (if-let [bucket-meta (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket]))]
+                        (if-let [bucket-meta (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket]))]
                           (let [objects (element-as-sexp (xml/parse (:body request) :namespace-aware false))]
                             (if (not= :Delete (first objects))
                               (respond {:status 400
@@ -1367,7 +1368,7 @@
               :delete (do
                         ($/-track-get-request! cost-tracker)
                         (cond (and (not-empty bucket) (empty? object))
-                              (if-let [bucket-meta (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+                              (if-let [bucket-meta (not-empty (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket])))]
                                 (if (pos? (:object-count bucket-meta 0))
                                   (respond {:status 409
                                             :headers xml-content-type
@@ -1376,8 +1377,8 @@
                                                    [:Resource {} (str \/ bucket)]
                                                    [:RequestId {} request-id]]})
                                   (do
-                                    (sv/<? sv/S (kp/-update-in konserve [:bucket-meta] #(dissoc % bucket)))
-                                    (sv/<? sv/S (kp/-update-in konserve [:version-meta] #(dissoc % bucket)))
+                                    (sv/<? sv/S (k/update-in konserve [:bucket-meta] #(dissoc % bucket)))
+                                    (sv/<? sv/S (k/update-in konserve [:version-meta] #(dissoc % bucket)))
                                     (respond {:status 204})))
                                 (respond {:status 404
                                           :headers xml-content-type
@@ -1387,7 +1388,7 @@
                                                  [:RequestId {} request-id]]}))
 
                               (and (not-empty bucket) (not-empty object))
-                              (if-let [bucket-meta (not-empty (sv/<? sv/S (kp/-get-in konserve [:bucket-meta bucket])))]
+                              (if-let [bucket-meta (not-empty (sv/<? sv/S (k/get-in konserve [:bucket-meta bucket])))]
                                 (respond (sv/<? sv/S (delete-object system request bucket object bucket-meta request-id)))
                                 (respond {:status 404}
                                          :headers xml-content-type
