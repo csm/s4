@@ -4,7 +4,7 @@
             [clojure.core.async :as async]
             [clojure.spec.alpha :as s]
             [s4.auth.protocols :as s4p]
-            [s4.util :refer [hex sha256 hmac-256]]
+            [s4.util :refer [hex sha256 hmac-256 unhex]]
             [superv.async :as sv]
             [clojure.tools.logging :as log])
   (:import [java.time ZonedDateTime LocalDateTime ZoneOffset]
@@ -14,7 +14,7 @@
            [java.time.temporal ChronoField]
            [java.security MessageDigest]
            [com.google.common.io ByteStreams]
-           [java.io ByteArrayInputStream InputStream]))
+           [java.io ByteArrayInputStream InputStream EOFException ByteArrayOutputStream]))
 
 (defn ^:no-doc split-path
   "Similar to String.split, string/split, etc., but will
@@ -259,6 +259,70 @@
     (log/debug tag (pr-str value)))
   value)
 
+(defn read-hex-value
+  [^InputStream input]
+  (loop [result 0
+         num 0]
+    (let [ch (.read input)]
+      (cond
+        (< ch 0) (if (= num 0)
+                   -1
+                   (throw (EOFException.)))
+        (= ch (int \;)) result
+        (<= (int \0) ch (int \9)) (recur (bit-or (bit-shift-left result 4) (- ch (int \0))) (inc num))
+        (<= (int \a) ch (int \f)) (recur (bit-or (bit-shift-left result 4) (+ 10 (- ch (int \a)))) (inc num))
+        (<= (int \A) ch (int \F)) (recur (bit-or (bit-shift-left result 4) (+ 10 (- ch (int \A)))) (inc num))
+        :else (throw (IllegalArgumentException. (str "invalid character " ch " in chunk header")))))))
+
+(defn read-expect
+  [^InputStream input ch-expect]
+  (let [ch (.read input)]
+    (cond
+      (neg? ch) (throw (EOFException.))
+      (not= (int ch-expect) ch) (throw (IllegalArgumentException. (str "expecting character " ch-expect " but read " (char ch))))
+      :else true)))
+
+(defn read-until
+  ([input ch-end] (let [b (StringBuilder.)] (read-until input b ch-end)))
+  ([input buffer ch-end]
+   (let [ch (.read input)]
+     (cond
+       (neg? ch) (throw (EOFException.))
+       (= (int ch-end) ch) (.toString buffer)
+       :else (recur input (.append buffer (char ch)) ch-end)))))
+
+(defn read-signature
+ [^InputStream input]
+ (doseq [ch "chunk-signature="]
+   (read-expect input ch))
+ (let [signature (unhex (read-until input \return))]
+   (read-until input \newline)
+   signature))
+
+(defn decode-chunked-upload
+  [mac-key seed-mac date auth-headers body]
+  (let [in (ByteArrayInputStream. body)
+        out (ByteArrayOutputStream.)]
+    (loop [last-mac seed-mac]
+      (let [chunk-length (debug "chunk length:" (read-hex-value in))]
+        (if (= -1 chunk-length)
+          [last-mac (.toByteArray out)]
+          (let [expected-mac (debug "chunk signature:" (read-signature in))
+                buffer (byte-array chunk-length)
+                _ (debug "read bytes:" (.read in buffer))
+                s2s (debug "chunk string-to-sign:" (str "AWS-HMAC-SHA256-PAYLOAD" \newline (.format date datetime-formatter) \newline
+                                                        (.format date date-formatter) \/ (get-in auth-headers [:Credential :region])
+                                                        \/ (get-in auth-headers [:Credential :service]) "/aws4_request" \newline
+                                                        (hex last-mac) \newline (hex (sha256 "")) \newline
+                                                        (hex (sha256 buffer))))
+                mac (debug "computed chunk signature:" (hmac-256 mac-key s2s))]
+            (when (not (MessageDigest/isEqual expected-mac mac))
+              (throw (IllegalArgumentException. "invalid signature")))
+            (read-expect in \return)
+            (read-expect in \newline)
+            (.write out buffer)
+            (recur mac)))))))
+
 (defn authenticating-handler
   "Create an asynchronous ring handler that authenticates
   requests before passing them on to `handler`.
@@ -273,12 +337,32 @@
         (if-let [auth-header (debug "parse-auth-header:" (parse-auth-header (get-in request [:headers "authorization"])))]
           (if-let [secret-access-key (debug "get-secret-access-key:" (sv/<?? sv/S (s4p/-get-secret-access-key auth-store (get-in auth-header [:Credential :access-key]))))]
             (let [body (debug "body:" (some-> (:body request) (ByteStreams/toByteArray)))
-                  body-sha256 (debug "content-sha256:" (-> (or body (byte-array 0)) sha256 hex))]
-              (if (and (some? (get-in request [:headers "x-amz-content-sha256"]))
-                       (not= body-sha256 (get-in request [:headers "x-amz-content-sha256"])))
-                (respond {:status 400})
+                  body-sha256 (debug "content-sha256:" (-> (or body (byte-array 0)) sha256 hex))
+                  sha256-header (debug "request-sha256:" (get-in request [:headers "x-amz-content-sha256"]))]
+              (cond
+                (= "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" sha256-header)
                 (let [date (debug "get-request-date:" (get-request-date request))
-                      canon-req (debug "canonical-request:" (canonical-request request (set (:SignedHeaders auth-header)) body-sha256 (get-in auth-header [:Credential :service])))
+                      canon-req (debug "canonical-request:" (canonical-request request (set (:SignedHeaders auth-header)) sha256-header (get-in auth-header [:Credential :service])))
+                      s2s (debug "string-to-sign:" (string-to-sign date (get-in auth-header [:Credential :region]) (sha256 canon-req) (get-in auth-header [:Credential :service])))
+                      key (debug "generate-signing-key:" (generate-signing-key (get-in auth-header [:Credential :region])
+                                                                               (get-in auth-header [:Credential :date])
+                                                                               (get-in auth-header [:Credential :service])
+                                                                               secret-access-key))
+                      seed-mac (debug "seed mac:" (hmac-256 key s2s))
+                      [final-mac body] (decode-chunked-upload key seed-mac date auth-header body)]
+                  (if (not (= (hex final-mac) (:Signature auth-header)))
+                    (respond {:status 400})
+                    (handler (assoc request :body (ByteArrayInputStream. body))
+                             respond error)))
+
+                (and (some? sha256-header)
+                     (not= "UNSIGNED-PAYLOAD" sha256-header)
+                     (not= body-sha256 sha256-header))
+                (respond {:status 400})
+
+                :else
+                (let [date (debug "get-request-date:" (get-request-date request))
+                      canon-req (debug "canonical-request:" (canonical-request request (set (:SignedHeaders auth-header)) sha256-header (get-in auth-header [:Credential :service])))
                       s2s (debug "string-to-sign:" (string-to-sign date (get-in auth-header [:Credential :region]) (sha256 canon-req) (get-in auth-header [:Credential :service])))
                       key (debug "generate-signing-key:" (generate-signing-key (get-in auth-header [:Credential :region])
                                                                                (get-in auth-header [:Credential :date])

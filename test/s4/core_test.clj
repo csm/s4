@@ -5,44 +5,13 @@
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [s4.core :as s4]
-            [konserve.protocols :as kp]
+            [s4.test-util :refer :all]
+            [konserve.core :as k]
             [clojure.core.async :as async])
   (:import [java.time Clock ZoneOffset Instant]
            [java.util Date]))
 
-(def ^:dynamic *s4* nil)
-(def ^:dynamic *port* nil)
-
-(def access-key "ACCESSKEY")
-(def secret-key "SECRET/ACCESS/KEY")
-
-(def epoch 0x5d000000) ; arbitrary
-
-(def secs (atom epoch))
-
-(defn static-clock
-  ([secs] (static-clock secs ZoneOffset/UTC))
-  ([secs zone]
-   (proxy [Clock] []
-     (getZone [] zone)
-     (withZone [zone] (static-clock secs zone))
-     (instant []
-       (let [rules (.getRules zone)
-             offset (.getOffset rules (Instant/ofEpochSecond @secs))
-             offset-secs (.getTotalSeconds offset)]
-         (Instant/ofEpochSecond (+ @secs offset-secs)))))))
-
-(use-fixtures
-  :each
-  (fn [f]
-    (let [s4 (s4/make-server! {:clock (static-clock secs)})]
-      (swap! (-> @s4 :auth-store :access-keys) assoc access-key secret-key)
-      (try
-        (binding [*s4* s4
-                  *port* (-> @s4 :bind-address (.getPort))]
-          (f))
-        (finally
-          (.close (:server @s4)))))))
+(use-fixtures :each fixture)
 
 (deftest test-s3-api
   (let [client (aws/client {:api :s3
@@ -184,7 +153,7 @@
              (aws/invoke client {:op :DeleteObject
                                  :request {:Bucket "test"
                                            :Key "encode$file.text"}})))
-      (is (empty? (async/<!! (kp/-get-in (:konserve @*s4*) [:blobs "test"]))))
+      (is (empty? (async/<!! (k/get-in (:konserve @*s4*) [:blobs "test"]))))
       (is (= {:Prefix ""
               :Delimiter ""
               :MaxKeys 1000

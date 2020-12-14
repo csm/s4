@@ -21,7 +21,18 @@
 
 (defn ^:no-doc hex
   [b]
-  (string/join (map #(format "%02x" %) b)))
+  (string/join (map #(format "%02x" (byte %)) b)))
+
+(defn unhex
+  [s]
+  (if (odd? (count s))
+    (recur (str \0 s))
+    (->> s
+         (partition 2)
+         (map string/join)
+         (map #(Integer/parseInt % 16))
+         (byte-array))))
+
 
 (defn to-byte-array
   [x]

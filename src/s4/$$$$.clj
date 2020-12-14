@@ -1,7 +1,7 @@
 (ns s4.$$$$
   "AWS cost estimator."
   (:require [clojure.core.async :as async]
-            [konserve.protocols :as kp])
+            [konserve.core :as k])
   (:import [java.util Date]))
 
 (defprotocol ICostTracker
@@ -38,10 +38,10 @@
   (-track-data-in! [_ bytes] (swap! data-in + bytes))
   (-track-data-out! [_ bytes] (swap! data-out + bytes))
   (-get-storage-used [_]
-    (if-let [buckets (async/<!! (kp/-get-in konserve [:bucket-meta]))]
+    (if-let [buckets (async/<!! (k/get-in konserve [:bucket-meta]))]
       (->> (keys buckets)
            (map (fn [bucket]
-                  (->> (async/<!! (kp/-get-in konserve [:version-meta bucket]))
+                  (->> (async/<!! (k/get-in konserve [:version-meta bucket]))
                        (vals)
                        (mapcat identity)
                        (map :content-length)

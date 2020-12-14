@@ -86,7 +86,8 @@
 (def handler (s4.core/make-reloadable-handler system))
 
 (require 'aleph.http)
-(def server (aleph.http/start-server (s4.core/aleph-async-ring-adapter handler) {:port 0}))
+(require 's4.util)
+(def server (aleph.http/start-server (s4.util/aleph-async-ring-adapter handler) {:port 0}))
 (def port (aleph.netty/port server))
 
 (require '[cognitect.aws.client.api :as aws])

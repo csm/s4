@@ -4,8 +4,8 @@
             [clojure.data.xml :as xml]
             [clojure.tools.logging :as log]
             [cemerick.uri :as uri]
+            [konserve.core :as k]
             [konserve.memory :as km]
-            [konserve.protocols :as kp]
             [s4.$$$$ :as $]
             [s4.auth :as auth]
             [s4.sqs.queues :refer :all]
@@ -133,7 +133,7 @@
   (sv/go-try
     sv/S
     (if-let [queue-name (get query "QueueName")]
-      (if (some? (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name])))
+      (if (some? (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name])))
         {:status 400
          :headers xml-content-type
          :body [:Error [:Code "QueueAlreadyExists"]]}
@@ -170,9 +170,9 @@
              :headers xml-content-type
              :body [:Error [:Code "InvalidParameterValue"]]}
             (do
-              (sv/<? sv/S (kp/-assoc-in konserve [:queue-meta queue-name] {:created (ZonedDateTime/now ZoneOffset/UTC)
-                                                                           :attributes (merge default-queue-attributes attributes)
-                                                                           :tags tags}))
+              (sv/<? sv/S (k/assoc-in konserve [:queue-meta queue-name] {:created (ZonedDateTime/now ZoneOffset/UTC)
+                                                                         :attributes (merge default-queue-attributes attributes)
+                                                                         :tags tags}))
               {:status 200
                :headers xml-content-type
                :body [:CreateQueueResponse
@@ -191,7 +191,7 @@
                                 (uri/uri)
                                 :path
                                 (string/replace #"^/*" ""))]
-      (if-let [queue-meta (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name]))]
+      (if-let [queue-meta (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name]))]
         (if-let [receipt-handle (get query "ReceiptHandle")]
           (let [queue (get-queue queues queue-name)
                 result (sv/<? sv/S (remove! queue (->Message nil receipt-handle nil nil nil)))]
@@ -220,8 +220,8 @@
                                 (uri/uri)
                                 :path
                                 (string/replace #"^/" ""))]
-      (let [[old new] (sv/<? sv/S (kp/-update-in konserve [:queue-meta]
-                                                 #(dissoc % queue-name)))]
+      (let [[old new] (sv/<? sv/S (k/update-in konserve [:queue-meta]
+                                                        #(dissoc % queue-name)))]
         (when-let [q (get @queues queue-name)]
           (stop q)
           (swap! queues dissoc queue-name))
@@ -244,7 +244,7 @@
                                 (uri/uri)
                                 :path
                                 (string/replace #"^/*" ""))]
-      (if-let [queue-meta (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name]))]
+      (if-let [queue-meta (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name]))]
         (let [attributes (->> query
                               (filter #(re-matches #"AttributeName\.[1-9]*[0-9]" (key %)))
                               (map #(vector (Integer/parseInt (second (string/split (key %) #"\.")))
@@ -300,7 +300,7 @@
   (sv/go-try
     sv/S
     (if-let [queue-name (get query "QueueName")]
-      (if-let [_queue-meta (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name]))]
+      (if-let [_queue-meta (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name]))]
         {:status 200
          :headers xml-content-type
          :body [:GetQueueUrlResponse
@@ -318,7 +318,7 @@
 (defmethod handle-request "ListQueues"
   [{:keys [konserve server-info]} _ request-id query]
   (sv/go-try sv/S
-             (let [queues (sv/<? sv/S (kp/-get-in konserve [:queue-meta]))
+             (let [queues (sv/<? sv/S (k/get-in konserve [:queue-meta]))
                    prefix (get query "QueueNamePrefix" "")]
                {:status 200
                 :headers xml-content-type
@@ -340,7 +340,7 @@
                                 (uri/uri)
                                 :path
                                 (string/replace #"^/*" ""))]
-      (if-let [queue-meta (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name]))]
+      (if-let [queue-meta (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name]))]
         {:status 200
          :headers xml-content-type
          :body [:ListQueueTagsResponse
@@ -363,7 +363,7 @@
                                 (uri/uri)
                                 :path
                                 (string/replace #"^/*" ""))]
-      (if-let [queue-meta (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name]))]
+      (if-let [queue-meta (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name]))]
         (let [max-messages (->> (get query "MaxNumberOfMessages" "1")
                                 (Integer/parseInt))
               visibility (->> (get query "VisibilityTimeout"
@@ -411,7 +411,7 @@
                                   (uri/uri)
                                   :path
                                   (string/replace #"^/*" ""))]
-        (if-let [queue-meta (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name]))]
+        (if-let [queue-meta (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name]))]
           (let [delay (->> (let [v (get query "DelaySeconds"
                                         (get-in queue-meta [:attributes :DelaySeconds]))]
                              (log/debug "DelaySeconds:" v)
@@ -495,7 +495,7 @@
                                 (uri/uri)
                                 :path
                                 (string/replace #"^/*" ""))]
-      (if-let [queue-meta (sv/<? sv/S (kp/-get-in konserve [:queue-meta queue-name]))]
+      (if-let [queue-meta (sv/<? sv/S (k/get-in konserve [:queue-meta queue-name]))]
         (let [tags (-> query
                        (->>
                          (filter #(re-matches #"Tag\.[1-9]*[0-9]\.(Key|Value)" (key %)))
@@ -515,7 +515,7 @@
              :headers xml-content-type
              :body [:ErrorResponse [:Error [:Code "InvalidQueryParameter"]]]}
             (do
-              (sv/<? sv/S (kp/-update-in konserve [:queue-meta queue-name :tags] #(merge % tags)))
+              (sv/<? sv/S (k/update-in konserve [:queue-meta queue-name :tags] #(merge % tags)))
               {:status 200
                :headers xml-content-type
                :body [:TagQueueResponse [:ResponseMetadata [:RequestId request-id]]]})))
