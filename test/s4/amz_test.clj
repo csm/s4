@@ -63,4 +63,4 @@
         (let [response (.listObjects client (-> (ListObjectsRequest/builder)
                                                 (.bucket "test")
                                                 (.build)))]
-          (is (= ["file"] (map #(.name %) (.contents response)))))))))
+          (is (= ["file"] (map #(.key %) (.contents response)))))))))

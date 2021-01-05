@@ -8,11 +8,18 @@
             [s4.auth :refer :all]
             s4.core
             [s4.util :refer :all]
-            [cemerick.uri :as uri])
+            [cemerick.uri :as uri]
+            [clojure.core.async :as async])
   (:import [java.net Socket]
            [com.google.common.io ByteStreams]
-           [java.io PushbackReader ByteArrayInputStream]
-           [java.util.zip ZipFile]))
+           [java.io PushbackReader ByteArrayInputStream ByteArrayOutputStream]
+           [java.util.zip ZipFile]
+           (java.util Arrays)))
+
+(use-fixtures :once
+  (fn [f]
+    (System/setProperty "s4.auth.debug" "true")
+    (f)))
 
 (defmethod print-method (type (byte-array 0))
   [this w]
@@ -21,13 +28,6 @@
                  (map #(format "%02x" %))
                  (string/join)))
   (.write w "\""))
-
-(defn unhex
-  [s]
-  (->> (partition 2 s)
-       (map string/join)
-       (map #(.byteValue (Integer/parseInt % 16)))
-       (byte-array)))
 
 (defn uri-encode-except-slash
   [s]
@@ -188,3 +188,48 @@ x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b785
   `(do ~@(gen-aws-tests*)))
 
 (gen-aws-tests)
+
+(deftest test-chunked-signature
+  (testing "that chunked signatures work"
+    (let [body (let [out (ByteArrayOutputStream. 66824)
+                     content (doto (byte-array 0x1000)
+                               (Arrays/fill (byte \a)))]
+                 (.write out (.getBytes "10000;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n"))
+                 (dotimes [_ 0x10]
+                   (.write out content))
+                 (.write out (byte \return))
+                 (.write out (byte \newline))
+                 (.write out (.getBytes "400;chunk-signature=0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497\r\n"))
+                 (.write out content 0 0x400)
+                 (.write out (byte \return))
+                 (.write out (byte \newline))
+                 (.write out (.getBytes "0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n"))
+                 (.write out (byte \return))
+                 (.write out (byte \newline))
+                 (.toByteArray out))
+          request {:uri "/examplebucket/chunkObject.txt"
+                   :request-method :put
+                   :headers {"host" "s3.amazonaws.com"
+                             "x-amz-date" "20130524T000000Z"
+                             "x-amz-storage-class" "REDUCED_REDUNDANCY"
+                             "authorization" "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class,Signature=4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"
+                             "x-amz-content-sha256" "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+                             "content-encoding" "aws-chunked"
+                             "x-amz-decoded-content-length" "66560"
+                             "content-length" "66824"}
+                   :body (ByteArrayInputStream. body)}
+          handler (authenticating-handler (fn [r respond error] (respond {:status 200}))
+                                          {:auth-store (reify s4.auth.protocols/AuthStore
+                                                         (-get-secret-access-key [_ id]
+                                                           (let [chan (async/promise-chan)]
+                                                             (when (= id "AKIAIOSFODNN7EXAMPLE")
+                                                               (async/put! chan "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"))
+                                                             (async/close! chan)
+                                                             chan)))})
+          response (promise)
+          error (promise)]
+      (handler request #(do (deliver response %) (deliver error nil))
+               #(do (deliver error %) (deliver response %)))
+      @response
+      (is (= {:status 200} @response)))))
+

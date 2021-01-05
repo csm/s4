@@ -296,24 +296,27 @@
  (doseq [ch "chunk-signature="]
    (read-expect input ch))
  (let [signature (unhex (read-until input \return))]
-   (read-until input \newline)
+   (read-expect input \newline)
    signature))
 
 (defn decode-chunked-upload
   [mac-key seed-mac date auth-headers body]
+  (log/debug :task :decode-chunked-upload
+             :phase :begin
+             :seed-mac seed-mac)
   (let [in (ByteArrayInputStream. body)
         out (ByteArrayOutputStream.)]
     (loop [last-mac seed-mac]
       (let [chunk-length (debug "chunk length:" (read-hex-value in))]
         (if (= -1 chunk-length)
-          [last-mac (.toByteArray out)]
+          (.toByteArray out)
           (let [expected-mac (debug "chunk signature:" (read-signature in))
                 buffer (byte-array chunk-length)
                 _ (debug "read bytes:" (.read in buffer))
-                s2s (debug "chunk string-to-sign:" (str "AWS-HMAC-SHA256-PAYLOAD" \newline (.format date datetime-formatter) \newline
+                s2s (debug "chunk string-to-sign:" (str "AWS4-HMAC-SHA256-PAYLOAD" \newline (.format date datetime-formatter) \newline
                                                         (.format date date-formatter) \/ (get-in auth-headers [:Credential :region])
                                                         \/ (get-in auth-headers [:Credential :service]) "/aws4_request" \newline
-                                                        (hex last-mac) \newline (hex (sha256 "")) \newline
+                                                        (hex last-mac) \newline (hex (sha256 (byte-array 0))) \newline
                                                         (hex (sha256 buffer))))
                 mac (debug "computed chunk signature:" (hmac-256 mac-key s2s))]
             (when (not (MessageDigest/isEqual expected-mac mac))
@@ -348,12 +351,12 @@
                                                                                (get-in auth-header [:Credential :date])
                                                                                (get-in auth-header [:Credential :service])
                                                                                secret-access-key))
-                      seed-mac (debug "seed mac:" (hmac-256 key s2s))
-                      [final-mac body] (decode-chunked-upload key seed-mac date auth-header body)]
-                  (if (not (= (hex final-mac) (:Signature auth-header)))
+                      seed-mac (debug "seed mac:" (hmac-256 key s2s))]
+                  (if (not (MessageDigest/isEqual seed-mac (unhex (:Signature auth-header))))
                     (respond {:status 400})
-                    (handler (assoc request :body (ByteArrayInputStream. body))
-                             respond error)))
+                    (let [body (decode-chunked-upload key seed-mac date auth-header body)]
+                      (handler (assoc request :body (ByteArrayInputStream. body))
+                               respond error))))
 
                 (and (some? sha256-header)
                      (not= "UNSIGNED-PAYLOAD" sha256-header)
