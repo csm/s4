@@ -1,5 +1,6 @@
 (ns s4.test-util
-  (:require [s4.core :as s4])
+  (:require [s4.core :as s4]
+            s4.server)
   (:import (java.time Instant Clock ZoneOffset)
            (java.net InetSocketAddress)))
 
@@ -27,7 +28,7 @@
 
 (defn fixture
   [f]
-  (let [s4 (s4/make-server! {:clock (static-clock secs)})]
+  (let [s4 (s4.server/make-server! {:clock (static-clock secs)})]
     (swap! (-> @s4 :auth-store :access-keys) assoc access-key secret-key)
     (try
       (binding [*s4* s4
