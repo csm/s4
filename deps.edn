@@ -1,0 +1,5 @@
+{:deps {org.clojure/clojure {:mvn/version "1.10.1"}
+        io.replikativ/konserve {:mvn/version "0.6.0-alpha2"}
+        io.replikativ/superv.async {:mvn/version "0.2.9"}
+        com.arohner/uri {:mvn/version "0.1.2"}
+        org.clojure/data.xml {:mvn/version "0.2.0-alpha6"}}}
