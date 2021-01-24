@@ -36,8 +36,8 @@
                                    [com.cognitect.aws/sqs "747.2.533.0"]
                                    [com.cognitect/anomalies "0.1.12"]
                                    [ring/ring-jetty-adapter "1.7.1"]
-                                   [software.amazon.awssdk/s3 "2.15.41"]
-                                   :jvm-opts ["-Ds4.auth.debug=true"]
-                                    :resource-paths ["test-resources"]]}
+                                   [software.amazon.awssdk/s3 "2.15.41"]]
+                    :jvm-opts ["-Ds4.auth.debug=true"]
+                    :resource-paths ["test-resources"]}
              :repl {:source-paths ["scripts"]}}
   :repl-options {:init-ns s4.repl})
